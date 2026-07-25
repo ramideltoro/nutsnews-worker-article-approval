@@ -14,6 +14,7 @@ import {
   loadApprovalConfig,
   type ApprovalConfig
 } from "./config.js";
+import { createArticleApprovalWorkHandler } from "./approval.js";
 import { createApprovalHttpServer } from "./http.js";
 import { createApprovalService } from "./service.js";
 import { createLocalApprovalDependencies } from "./test-doubles.js";
@@ -32,13 +33,27 @@ export type {
   ApprovalDatabaseTransactionRunner,
   ApprovalDependencies,
   ApprovalDependencyProbe,
+  ApprovalDecisionKey,
+  ApprovalEnrichmentRecord,
+  ApprovalEnrichmentRecordInput,
+  ApprovalMetadataReference,
   ApprovalPrompt,
   ApprovalPromptRegistry,
   ApprovalQwenClient,
+  ApprovalQwenRequest,
   ApprovalStateStore,
+  ApprovalStoredDecision,
+  ApprovalTranslationPublication,
   ApprovalWorkHandler,
   ApprovalWorkTools
 } from "./dependencies.js";
+export {
+  ApprovalQwenError
+} from "./dependencies.js";
+export {
+  createArticleApprovalWorkHandler,
+  type ArticleApprovalWorkHandlerOptions
+} from "./approval.js";
 export {
   createApprovalHttpServer,
   type ApprovalHttpServer
@@ -89,9 +104,19 @@ export function createApprovalApplication(config = loadApprovalConfig()): Approv
       })
     : undefined;
   const telemetry = combineTelemetrySinks(logSink, metrics);
-  const dependencies = createLocalApprovalDependencies({
+  const baseDependencies = createLocalApprovalDependencies({
     clock: SYSTEM_RUNTIME_CLOCK
   });
+  const dependencies = {
+    ...baseDependencies,
+    workHandler: createArticleApprovalWorkHandler({
+      config,
+      dependencies: baseDependencies,
+      ...(telemetry === undefined ? {} : {
+        telemetry
+      })
+    })
+  };
   const service = createApprovalService({
     config,
     dependencies,

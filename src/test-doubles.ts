@@ -33,10 +33,16 @@ import type {
   ApprovalDatabaseTransactionRunner,
   ApprovalDependencies,
   ApprovalDependencyProbe,
+  ApprovalDecisionKey,
+  ApprovalEnrichmentRecord,
+  ApprovalEnrichmentRecordInput,
   ApprovalPrompt,
   ApprovalPromptRegistry,
+  ApprovalQwenRequest,
   ApprovalQwenClient,
   ApprovalStateStore,
+  ApprovalStoredDecision,
+  ApprovalTranslationPublication,
   ApprovalWorkHandler,
   ApprovalWorkTools
 } from "./dependencies.js";
@@ -60,6 +66,8 @@ export class ManualApprovalClock implements RuntimeClock {
 export class InMemoryApprovalStateStore implements ApprovalStateStore {
   readonly name: string = "local-approval-state";
   status: ApprovalDependencyProbe["status"] = "ok";
+  readonly decisions: ApprovalStoredDecision[] = [];
+  readonly enrichmentRecords = new Map<string, ApprovalEnrichmentRecord>();
   private readonly store;
 
   constructor(clock: RuntimeClock = new ManualApprovalClock()) {
@@ -83,6 +91,96 @@ export class InMemoryApprovalStateStore implements ApprovalStateStore {
 
   markFailed(idempotencyKey: string, failure: RuntimeIdempotencyFailure): Promise<void> {
     return this.store.markFailed(idempotencyKey, failure);
+  }
+
+  loadEnrichmentRecord(input: ApprovalEnrichmentRecordInput, transaction: ApprovalDatabaseTransaction): Promise<ApprovalEnrichmentRecord> {
+    void transaction;
+    const key = enrichmentRecordKey(input.articleMetadataRef.canonicalArticleId, input.articleMetadataRef.articleVersion);
+    const existing = this.enrichmentRecords.get(key);
+
+    if (existing !== undefined) {
+      return Promise.resolve(existing);
+    }
+
+    const record: ApprovalEnrichmentRecord = {
+      candidateId: input.candidateId,
+      canonicalArticleId: input.articleMetadataRef.canonicalArticleId,
+      articleVersion: input.articleMetadataRef.articleVersion,
+      canonicalUrl: input.canonicalUrl,
+      imageStatus: input.imageStatus,
+      ...(input.imageUrl === undefined ? {} : {
+        imageUrl: input.imageUrl
+      }),
+      contentFingerprint: input.articleMetadataRef.contentFingerprint,
+      title: input.articleMetadataRef.title ?? "Synthetic world story",
+      ...(input.articleMetadataRef.description === undefined ? {} : {
+        description: input.articleMetadataRef.description
+      }),
+      ...(input.articleMetadataRef.publishedAt === undefined ? {} : {
+        publishedAt: input.articleMetadataRef.publishedAt
+      }),
+      sourceLanguage: input.articleMetadataRef.language ?? "en",
+      metadataRef: input.articleMetadataRef
+    };
+
+    this.enrichmentRecords.set(key, record);
+
+    return Promise.resolve(record);
+  }
+
+  findDecision(key: ApprovalDecisionKey, transaction: ApprovalDatabaseTransaction): Promise<ApprovalStoredDecision | undefined> {
+    void transaction;
+
+    return Promise.resolve(this.decisions.find((decision) => decision.canonicalArticleId === key.canonicalArticleId
+      && decision.articleVersion === key.articleVersion
+      && decision.promptId === key.promptId
+      && decision.promptVersion === key.promptVersion
+      && decision.model === key.model));
+  }
+
+  recordDecision(decision: ApprovalStoredDecision, transaction: ApprovalDatabaseTransaction): Promise<ApprovalStoredDecision> {
+    void transaction;
+    const existingIndex = this.decisions.findIndex((stored) => stored.decisionId === decision.decisionId);
+
+    if (existingIndex === -1) {
+      this.decisions.push(decision);
+    } else {
+      this.decisions[existingIndex] = decision;
+    }
+
+    return Promise.resolve(decision);
+  }
+
+  markTranslationPublished(
+    decisionId: string,
+    publication: ApprovalTranslationPublication,
+    transaction: ApprovalDatabaseTransaction
+  ): Promise<ApprovalStoredDecision> {
+    void transaction;
+    const existingIndex = this.decisions.findIndex((decision) => decision.decisionId === decisionId);
+
+    if (existingIndex === -1) {
+      return Promise.reject(new Error(`Approval decision ${decisionId} is not recorded.`));
+    }
+
+    const existing = this.decisions[existingIndex];
+
+    if (existing === undefined) {
+      return Promise.reject(new Error(`Approval decision ${decisionId} is not recorded.`));
+    }
+
+    const updated = {
+      ...existing,
+      translationPublication: publication
+    } satisfies ApprovalStoredDecision;
+
+    this.decisions[existingIndex] = updated;
+
+    return Promise.resolve(updated);
+  }
+
+  seedEnrichmentRecord(record: ApprovalEnrichmentRecord): void {
+    this.enrichmentRecords.set(enrichmentRecordKey(record.canonicalArticleId, record.articleVersion), record);
   }
 }
 
@@ -133,12 +231,40 @@ export class LocalApprovalBrokerOutbox implements ApprovalBrokerOutbox {
 export class LocalApprovalQwenClient implements ApprovalQwenClient {
   readonly name: string = "local-qwen-client";
   status: ApprovalDependencyProbe["status"] = "ok";
+  readonly requests: ApprovalQwenRequest[] = [];
+  response: unknown = {
+    decision: "accepted",
+    reasonCode: "newsworthy",
+    confidenceScore: 92,
+    qualityScore: 88,
+    positivityScore: 73,
+    summary: "A concise source-language summary that is long enough for approval fixtures.",
+    latencyMs: 42,
+    usage: {
+      inputTokens: 120,
+      outputTokens: 36,
+      totalTokens: 156
+    }
+  };
+  error: unknown;
 
   probe(): ApprovalDependencyProbe {
     return {
       status: this.status,
       summary: this.status === "ok" ? "local Qwen endpoint ready" : "local Qwen endpoint degraded"
     };
+  }
+
+  review(request: ApprovalQwenRequest): Promise<unknown> {
+    this.requests.push(request);
+
+    if (this.error !== undefined) {
+      const reason = typeof this.error === "string" ? this.error : "local Qwen fixture error";
+
+      return Promise.reject(this.error instanceof Error ? this.error : new Error(reason));
+    }
+
+    return Promise.resolve(this.response);
   }
 }
 
@@ -148,7 +274,8 @@ export class LocalApprovalPromptRegistry implements ApprovalPromptRegistry {
   prompt: ApprovalPrompt = {
     id: "editorial-approval-v1",
     version: "0.1.0",
-    purpose: "editorial-approval"
+    purpose: "editorial-approval",
+    instructions: "Return a structured editorial approval decision without copying secrets or raw article bodies."
   };
 
   probe(): ApprovalDependencyProbe {
@@ -341,6 +468,7 @@ export function createMinimalApprovalPayload(
       canonicalArticleId: "article-001",
       articleVersion: 1,
       title: "Synthetic world story",
+      description: "A durable metadata description retained by reference for local approval tests.",
       language: "en"
     },
     ...overrides
@@ -353,4 +481,8 @@ export function createMinimalApprovalDelivery(): RuntimeMessageDelivery {
     payload: createMinimalApprovalPayload(),
     receivedAt: "2026-07-23T00:00:01.000Z"
   };
+}
+
+function enrichmentRecordKey(canonicalArticleId: string, articleVersion: number): string {
+  return `${canonicalArticleId}:${String(articleVersion)}`;
 }

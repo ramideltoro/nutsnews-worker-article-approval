@@ -23,8 +23,20 @@ describe("loadApprovalConfig", () => {
       prefetch: 4,
       qwen: {
         model: "qwen2.5:3b",
+        promptId: "editorial-approval-v1",
         totalTimeoutMs: 30_000,
         maxInputBytes: 32_768
+      },
+      targetLanguages: [
+        "fr",
+        "ja",
+        "de-CH",
+        "de",
+        "el"
+      ],
+      summary: {
+        minChars: 40,
+        maxChars: 600
       },
       shadowMode: true,
       dependencies: {
@@ -67,8 +79,34 @@ describe("loadApprovalConfig", () => {
       NUTSNEWS_APPROVAL_PREFETCH: "2",
       NUTSNEWS_APPROVAL_QWEN_TOTAL_TIMEOUT_MS: "10",
       NUTSNEWS_APPROVAL_QWEN_MAX_INPUT_BYTES: "16",
+      NUTSNEWS_APPROVAL_SUMMARY_MIN_CHARS: "700",
+      NUTSNEWS_APPROVAL_SUMMARY_MAX_CHARS: "80",
       NUTSNEWS_APPROVAL_SHADOW_MODE: "false"
     })).toThrow(ApprovalConfigError);
+  });
+
+  it("parses approval prompt, target language, and summary bounds overrides", () => {
+    const config = loadApprovalConfig({
+      NUTSNEWS_APPROVAL_QWEN_MODEL: "qwen-test",
+      NUTSNEWS_APPROVAL_PROMPT_ID: "editorial-approval-v2",
+      NUTSNEWS_APPROVAL_TARGET_LANGUAGES: "fr, ja, fr, de",
+      NUTSNEWS_APPROVAL_SUMMARY_MIN_CHARS: "20",
+      NUTSNEWS_APPROVAL_SUMMARY_MAX_CHARS: "300"
+    });
+
+    expect(config.qwen).toMatchObject({
+      model: "qwen-test",
+      promptId: "editorial-approval-v2"
+    });
+    expect(config.targetLanguages).toEqual([
+      "fr",
+      "ja",
+      "de"
+    ]);
+    expect(config.summary).toEqual({
+      minChars: 20,
+      maxChars: 300
+    });
   });
 
   it("accepts explicit production dependency presence without retaining sensitive values", () => {

@@ -16,6 +16,10 @@ export interface ApprovalDependencyProbe {
 export interface ApprovalStateStore extends RuntimeIdempotencyStore {
   readonly name: string;
   probe(): ApprovalDependencyProbe | Promise<ApprovalDependencyProbe>;
+  loadEnrichmentRecord(input: ApprovalEnrichmentRecordInput, transaction: ApprovalDatabaseTransaction): Promise<ApprovalEnrichmentRecord>;
+  findDecision(key: ApprovalDecisionKey, transaction: ApprovalDatabaseTransaction): Promise<ApprovalStoredDecision | undefined>;
+  recordDecision(decision: ApprovalStoredDecision, transaction: ApprovalDatabaseTransaction): Promise<ApprovalStoredDecision>;
+  markTranslationPublished(decisionId: string, publication: ApprovalTranslationPublication, transaction: ApprovalDatabaseTransaction): Promise<ApprovalStoredDecision>;
 }
 
 export interface ApprovalDatabaseTransaction {
@@ -37,12 +41,14 @@ export interface ApprovalBrokerOutbox {
 export interface ApprovalQwenClient {
   readonly name: string;
   probe(): ApprovalDependencyProbe | Promise<ApprovalDependencyProbe>;
+  review(request: ApprovalQwenRequest): Promise<unknown>;
 }
 
 export interface ApprovalPrompt {
   readonly id: string;
   readonly version: string;
   readonly purpose: "editorial-approval";
+  readonly instructions: string;
 }
 
 export interface ApprovalPromptRegistry {
@@ -71,4 +77,155 @@ export interface ApprovalDependencies {
   readonly qwenClient: ApprovalQwenClient;
   readonly promptRegistry: ApprovalPromptRegistry;
   readonly workHandler: ApprovalWorkHandler;
+}
+
+export interface ApprovalEnrichmentRecordInput {
+  readonly candidateId: string;
+  readonly canonicalUrl: string;
+  readonly imageStatus: "hydrated" | "no_thumbnail" | "transient_failure";
+  readonly imageUrl?: string;
+  readonly articleMetadataRef: ApprovalMetadataReference;
+}
+
+export interface ApprovalMetadataReference {
+  readonly kind: "backend-record";
+  readonly uri: string;
+  readonly mediaType: "application/json";
+  readonly contentFingerprint: string;
+  readonly canonicalArticleId: string;
+  readonly articleVersion: number;
+  readonly title?: string;
+  readonly description?: string;
+  readonly publishedAt?: string;
+  readonly language?: string;
+}
+
+export interface ApprovalEnrichmentRecord {
+  readonly candidateId: string;
+  readonly canonicalArticleId: string;
+  readonly articleVersion: number;
+  readonly canonicalUrl: string;
+  readonly imageStatus: ApprovalEnrichmentRecordInput["imageStatus"];
+  readonly imageUrl?: string;
+  readonly contentFingerprint: string;
+  readonly title: string;
+  readonly description?: string;
+  readonly publishedAt?: string;
+  readonly sourceLanguage: string;
+  readonly metadataRef: ApprovalMetadataReference;
+}
+
+export interface ApprovalDecisionKey {
+  readonly canonicalArticleId: string;
+  readonly articleVersion: number;
+  readonly promptId: string;
+  readonly promptVersion: string;
+  readonly model: string;
+}
+
+export interface ApprovalTranslationPublication {
+  readonly messageId: string;
+  readonly idempotencyKey: string;
+  readonly publishedAt: string;
+}
+
+export interface ApprovalStoredDecision {
+  readonly decisionId: string;
+  readonly candidateId: string;
+  readonly canonicalArticleId: string;
+  readonly articleVersion: number;
+  readonly canonicalUrl: string;
+  readonly decision: "accepted" | "rejected" | "permanent_failure";
+  readonly rejectionReason?: string;
+  readonly provider: "prefilter" | "local_ai" | "legacy_openai_fallback";
+  readonly model: string;
+  readonly promptId: string;
+  readonly promptVersion: string;
+  readonly positivityScore: number;
+  readonly confidenceScore: number;
+  readonly qualityScore: number;
+  readonly sourceLanguage: string;
+  readonly sourceSummary?: string;
+  readonly contentFingerprint: string;
+  readonly reviewRef: {
+    readonly kind: "backend-record";
+    readonly uri: string;
+    readonly mediaType: "application/json";
+    readonly decisionId: string;
+    readonly canonicalArticleId: string;
+    readonly articleVersion: number;
+    readonly promptId: string;
+    readonly promptVersion: string;
+    readonly model: string;
+    readonly traceparent: string;
+    readonly sourceMessageId: string;
+  };
+  readonly summaryRef?: {
+    readonly kind: "backend-record";
+    readonly uri: string;
+    readonly mediaType: "application/json";
+    readonly decisionId: string;
+    readonly sourceLanguage: string;
+  };
+  readonly aiUsageRef?: {
+    readonly kind: "backend-record";
+    readonly uri: string;
+    readonly mediaType: "application/json";
+    readonly inputTokens: number;
+    readonly outputTokens: number;
+    readonly totalTokens: number;
+  };
+  readonly sourceMessageId: string;
+  readonly correlationId: string;
+  readonly traceparent: string;
+  readonly latencyMs: number;
+  readonly decidedAt: string;
+  readonly translationPublication?: ApprovalTranslationPublication;
+}
+
+export interface ApprovalQwenRequest {
+  readonly model: string;
+  readonly prompt: ApprovalPrompt;
+  readonly timeoutMs: number;
+  readonly maxInputBytes: number;
+  readonly deterministic: {
+    readonly temperature: 0;
+    readonly topP: 1;
+  };
+  readonly responseSchema: {
+    readonly name: "approval_decision_v1";
+    readonly requiredFields: readonly string[];
+  };
+  readonly input: {
+    readonly candidateId: string;
+    readonly canonicalArticleId: string;
+    readonly articleVersion: number;
+    readonly canonicalUrl: string;
+    readonly title: string;
+    readonly description?: string;
+    readonly imageUrl?: string;
+    readonly sourceLanguage: string;
+    readonly contentFingerprint: string;
+  };
+  readonly inputBytes: number;
+}
+
+export class ApprovalQwenError extends Error {
+  readonly reason: "qwen-timeout" | "qwen-unauthorized" | "qwen-model-error";
+  readonly retryable: boolean;
+  readonly retryAfterMs: number | undefined;
+
+  constructor(
+    reason: ApprovalQwenError["reason"],
+    options: {
+      readonly retryable: boolean;
+      readonly retryAfterMs?: number;
+    }
+  ) {
+    super(reason);
+    this.name = "ApprovalQwenError";
+    this.reason = reason;
+    this.retryable = options.retryable;
+    this.retryAfterMs = options.retryAfterMs;
+  }
 }
