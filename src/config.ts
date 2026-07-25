@@ -24,10 +24,14 @@ export const APPROVAL_CONFIG_SCHEMA = [
   variable("NUTSNEWS_APPROVAL_QWEN_BASE_URL", "Private Qwen-compatible approval endpoint.", true, true),
   variable("NUTSNEWS_APPROVAL_QWEN_API_KEY", "Credential for the Qwen-compatible approval endpoint.", true, true),
   variable("NUTSNEWS_APPROVAL_QWEN_MODEL", "Model identifier used by the injected approval client.", false, false, "qwen2.5:3b"),
+  variable("NUTSNEWS_APPROVAL_PROMPT_ID", "Versioned approval prompt identifier.", false, false, "editorial-approval-v1"),
+  variable("NUTSNEWS_APPROVAL_TARGET_LANGUAGES", "Comma-separated translation target languages requested for accepted articles.", false, false, "fr,ja,de-CH,de,el"),
   variable("NUTSNEWS_APPROVAL_CONCURRENCY", "Maximum concurrent approval message handlers.", false, false, "2"),
   variable("NUTSNEWS_APPROVAL_PREFETCH", "Broker prefetch bound for approval deliveries.", false, false, "4"),
   variable("NUTSNEWS_APPROVAL_QWEN_TOTAL_TIMEOUT_MS", "Maximum approval endpoint call timeout in milliseconds.", false, false, "30000"),
   variable("NUTSNEWS_APPROVAL_QWEN_MAX_INPUT_BYTES", "Maximum prompt input reference size accepted by approval.", false, false, "32768"),
+  variable("NUTSNEWS_APPROVAL_SUMMARY_MIN_CHARS", "Minimum accepted source summary length.", false, false, "40"),
+  variable("NUTSNEWS_APPROVAL_SUMMARY_MAX_CHARS", "Maximum accepted source summary length.", false, false, "600"),
   variable("NUTSNEWS_APPROVAL_SHUTDOWN_TIMEOUT_MS", "Graceful shutdown drain timeout in milliseconds.", false, false, "30000"),
   variable("NUTSNEWS_APPROVAL_SHADOW_MODE", "Keep approval output isolated from legacy ingestion.", false, false, "true"),
   variable("NUTSNEWS_APPROVAL_TELEMETRY_LOGS", "Structured runtime log sink mode.", false, false, "stdout"),
@@ -52,8 +56,14 @@ export interface ApprovalConfig {
   };
   readonly qwen: {
     readonly model: string;
+    readonly promptId: string;
     readonly totalTimeoutMs: number;
     readonly maxInputBytes: number;
+  };
+  readonly targetLanguages: readonly string[];
+  readonly summary: {
+    readonly minChars: number;
+    readonly maxChars: number;
   };
   readonly concurrency: number;
   readonly prefetch: number;
@@ -105,8 +115,14 @@ export function loadApprovalConfig(env: NodeJS.ProcessEnv = process.env): Approv
     dependencies,
     qwen: {
       model: nonEmpty(env.NUTSNEWS_APPROVAL_QWEN_MODEL, "qwen2.5:3b"),
+      promptId: nonEmpty(env.NUTSNEWS_APPROVAL_PROMPT_ID, "editorial-approval-v1"),
       totalTimeoutMs: parseInteger(env.NUTSNEWS_APPROVAL_QWEN_TOTAL_TIMEOUT_MS, "NUTSNEWS_APPROVAL_QWEN_TOTAL_TIMEOUT_MS", 30_000, 1_000, 180_000, issues),
       maxInputBytes: parseInteger(env.NUTSNEWS_APPROVAL_QWEN_MAX_INPUT_BYTES, "NUTSNEWS_APPROVAL_QWEN_MAX_INPUT_BYTES", 32_768, 1_024, 1_048_576, issues)
+    },
+    targetLanguages: parseList(env.NUTSNEWS_APPROVAL_TARGET_LANGUAGES, "NUTSNEWS_APPROVAL_TARGET_LANGUAGES", "fr,ja,de-CH,de,el", issues),
+    summary: {
+      minChars: parseInteger(env.NUTSNEWS_APPROVAL_SUMMARY_MIN_CHARS, "NUTSNEWS_APPROVAL_SUMMARY_MIN_CHARS", 40, 1, 1_000, issues),
+      maxChars: parseInteger(env.NUTSNEWS_APPROVAL_SUMMARY_MAX_CHARS, "NUTSNEWS_APPROVAL_SUMMARY_MAX_CHARS", 600, 40, 4_000, issues)
     },
     concurrency,
     prefetch,
@@ -122,6 +138,10 @@ export function loadApprovalConfig(env: NodeJS.ProcessEnv = process.env): Approv
 
   if (!config.shadowMode) {
     issues.push("NUTSNEWS_APPROVAL_SHADOW_MODE must remain true until backend-owned deployment enables cutover.");
+  }
+
+  if (config.summary.maxChars < config.summary.minChars) {
+    issues.push("NUTSNEWS_APPROVAL_SUMMARY_MAX_CHARS must be greater than or equal to NUTSNEWS_APPROVAL_SUMMARY_MIN_CHARS.");
   }
 
   if (issues.length > 0) {
@@ -233,6 +253,20 @@ function parseInteger(
   }
 
   return parsed;
+}
+
+function parseList(value: string | undefined, key: string, fallback: string, issues: string[]): readonly string[] {
+  const entries = nonEmpty(value, fallback)
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0);
+
+  if (entries.length === 0) {
+    issues.push(`${key} must include at least one value.`);
+    return fallback.split(",");
+  }
+
+  return Array.from(new Set(entries));
 }
 
 function requireConfigured(key: string, configured: boolean, issues: string[]): void {

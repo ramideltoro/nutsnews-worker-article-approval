@@ -90,7 +90,37 @@ describe("approval test doubles", () => {
     await expect(promptRegistry.getPrompt("editorial-approval-v1")).resolves.toEqual({
       id: "editorial-approval-v1",
       version: "0.1.0",
-      purpose: "editorial-approval"
+      purpose: "editorial-approval",
+      instructions: "Return a structured editorial approval decision without copying secrets or raw article bodies."
     });
+    await expect(qwenClient.review({
+      model: "qwen2.5:3b",
+      prompt: promptRegistry.prompt,
+      timeoutMs: 30_000,
+      maxInputBytes: 32_768,
+      deterministic: {
+        temperature: 0,
+        topP: 1
+      },
+      responseSchema: {
+        name: "approval_decision_v1",
+        requiredFields: [
+          "decision"
+        ]
+      },
+      input: {
+        candidateId: "candidate-world-001",
+        canonicalArticleId: "article-001",
+        articleVersion: 1,
+        canonicalUrl: "https://articles.example.test/world/story-001",
+        title: "Synthetic world story",
+        sourceLanguage: "en",
+        contentFingerprint: "fingerprint001"
+      },
+      inputBytes: 256
+    })).resolves.toMatchObject({
+      decision: "accepted"
+    });
+    expect(qwenClient.requests).toHaveLength(1);
   });
 });
