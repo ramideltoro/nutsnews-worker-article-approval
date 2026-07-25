@@ -2,8 +2,6 @@ import { createHash, randomUUID } from "node:crypto";
 
 import {
   WORKER_DELIVERY_BEHAVIOR,
-  WORKER_EXCHANGES,
-  WORKER_QUEUE_TYPE,
   getWorkerRoute,
   type WorkerMessageEnvelope,
   type WorkerRoute,
@@ -172,8 +170,7 @@ export class PayloadRabbitMqTransport implements RuntimeBrokerTransport {
 
   async assertTopology(routes: readonly WorkerRoute[]): Promise<void> {
     this.routes = routes;
-    const channel = await this.ensureChannel();
-    await assertTopology(channel, routes);
+    await this.ensureChannel();
   }
 
   async publish(command: BrokerPublishCommand): Promise<BrokerPublishReceipt> {
@@ -293,10 +290,6 @@ export class PayloadRabbitMqTransport implements RuntimeBrokerTransport {
     channel.on("close", () => {
       this.channel = undefined;
     });
-
-    if (this.routes.length > 0) {
-      await assertTopology(channel, this.routes);
-    }
 
     return channel;
   }
@@ -897,35 +890,6 @@ function transactionClient(transaction: ApprovalDatabaseTransaction): PoolClient
   return client;
 }
 
-async function assertTopology(channel: ConfirmChannel, routes: readonly WorkerRoute[]): Promise<void> {
-  await channel.assertExchange(WORKER_EXCHANGES.main.name, WORKER_EXCHANGES.main.type, {
-    durable: WORKER_EXCHANGES.main.durable
-  });
-  await channel.assertExchange(WORKER_EXCHANGES.retry.name, WORKER_EXCHANGES.retry.type, {
-    durable: WORKER_EXCHANGES.retry.durable
-  });
-  await channel.assertExchange(WORKER_EXCHANGES.dlq.name, WORKER_EXCHANGES.dlq.type, {
-    durable: WORKER_EXCHANGES.dlq.durable
-  });
-
-  for (const route of routes) {
-    await channel.assertQueue(route.mainQueue.name, quorumQueueOptions());
-    await channel.bindQueue(route.mainQueue.name, route.exchange, route.routingKey);
-
-    for (const retryQueue of route.retryQueues) {
-      await channel.assertQueue(retryQueue.name, quorumQueueOptions({
-        "x-message-ttl": retryQueue.ttlMs,
-        "x-dead-letter-exchange": retryQueue.deadLetterExchange,
-        "x-dead-letter-routing-key": retryQueue.deadLetterRoutingKey
-      }));
-      await channel.bindQueue(retryQueue.name, route.retryExchange, retryQueue.routingKey);
-    }
-
-    await channel.assertQueue(route.terminalDlq.name, quorumQueueOptions());
-    await channel.bindQueue(route.terminalDlq.name, route.dlqExchange, route.terminalDlq.routingKey);
-  }
-}
-
 async function publishCarrierWithConfirm(
   channel: ConfirmChannel,
   options: {
@@ -1038,16 +1002,6 @@ function publishOptions(envelope: WorkerMessageEnvelope, retryJitterMs: number |
       ...(retryJitterMs === undefined ? {} : {
         retryJitterMs
       })
-    }
-  };
-}
-
-function quorumQueueOptions(extraArguments: Readonly<Record<string, unknown>> = {}): Options.AssertQueue {
-  return {
-    durable: true,
-    arguments: {
-      "x-queue-type": WORKER_QUEUE_TYPE,
-      ...extraArguments
     }
   };
 }
