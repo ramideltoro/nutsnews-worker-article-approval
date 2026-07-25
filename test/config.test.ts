@@ -25,7 +25,10 @@ describe("loadApprovalConfig", () => {
         model: "qwen2.5:3b",
         promptId: "editorial-approval-v1",
         totalTimeoutMs: 30_000,
-        maxInputBytes: 32_768
+        maxInputBytes: 32_768,
+        maxParallelCalls: 1,
+        maxQueuedCalls: 3,
+        backpressureRetryAfterMs: 5_000
       },
       targetLanguages: [
         "fr",
@@ -37,6 +40,13 @@ describe("loadApprovalConfig", () => {
       summary: {
         minChars: 40,
         maxChars: 600
+      },
+      openAiFallback: {
+        enabled: false,
+        protectedFlag: false,
+        budgetUsd: 0,
+        provenanceMarker: "",
+        alertTopic: ""
       },
       shadowMode: true,
       dependencies: {
@@ -79,6 +89,8 @@ describe("loadApprovalConfig", () => {
       NUTSNEWS_APPROVAL_PREFETCH: "2",
       NUTSNEWS_APPROVAL_QWEN_TOTAL_TIMEOUT_MS: "10",
       NUTSNEWS_APPROVAL_QWEN_MAX_INPUT_BYTES: "16",
+      NUTSNEWS_APPROVAL_QWEN_MAX_PARALLEL_CALLS: "9",
+      NUTSNEWS_APPROVAL_QWEN_MAX_QUEUED_CALLS: "8",
       NUTSNEWS_APPROVAL_SUMMARY_MIN_CHARS: "700",
       NUTSNEWS_APPROVAL_SUMMARY_MAX_CHARS: "80",
       NUTSNEWS_APPROVAL_SHADOW_MODE: "false"
@@ -89,6 +101,10 @@ describe("loadApprovalConfig", () => {
     const config = loadApprovalConfig({
       NUTSNEWS_APPROVAL_QWEN_MODEL: "qwen-test",
       NUTSNEWS_APPROVAL_PROMPT_ID: "editorial-approval-v2",
+      NUTSNEWS_APPROVAL_PREFETCH: "5",
+      NUTSNEWS_APPROVAL_QWEN_MAX_PARALLEL_CALLS: "2",
+      NUTSNEWS_APPROVAL_QWEN_MAX_QUEUED_CALLS: "3",
+      NUTSNEWS_APPROVAL_QWEN_BACKPRESSURE_RETRY_AFTER_MS: "12000",
       NUTSNEWS_APPROVAL_TARGET_LANGUAGES: "fr, ja, fr, de",
       NUTSNEWS_APPROVAL_SUMMARY_MIN_CHARS: "20",
       NUTSNEWS_APPROVAL_SUMMARY_MAX_CHARS: "300"
@@ -96,7 +112,10 @@ describe("loadApprovalConfig", () => {
 
     expect(config.qwen).toMatchObject({
       model: "qwen-test",
-      promptId: "editorial-approval-v2"
+      promptId: "editorial-approval-v2",
+      maxParallelCalls: 2,
+      maxQueuedCalls: 3,
+      backpressureRetryAfterMs: 12_000
     });
     expect(config.targetLanguages).toEqual([
       "fr",
@@ -106,6 +125,28 @@ describe("loadApprovalConfig", () => {
     expect(config.summary).toEqual({
       minChars: 20,
       maxChars: 300
+    });
+  });
+
+  it("requires protected fallback controls before OpenAI fallback can be enabled", () => {
+    expect(() => loadApprovalConfig({
+      NUTSNEWS_APPROVAL_OPENAI_FALLBACK_ENABLED: "true"
+    })).toThrow(ApprovalConfigError);
+
+    const config = loadApprovalConfig({
+      NUTSNEWS_APPROVAL_OPENAI_FALLBACK_ENABLED: "true",
+      NUTSNEWS_APPROVAL_OPENAI_FALLBACK_PROTECTED_FLAG: "true",
+      NUTSNEWS_APPROVAL_OPENAI_FALLBACK_BUDGET_USD: "25.50",
+      NUTSNEWS_APPROVAL_OPENAI_FALLBACK_PROVENANCE_MARKER: "legacy_openai_fallback",
+      NUTSNEWS_APPROVAL_OPENAI_FALLBACK_ALERT_TOPIC: "ops.approval-fallback"
+    });
+
+    expect(config.openAiFallback).toEqual({
+      enabled: true,
+      protectedFlag: true,
+      budgetUsd: 25.5,
+      provenanceMarker: "legacy_openai_fallback",
+      alertTopic: "ops.approval-fallback"
     });
   });
 

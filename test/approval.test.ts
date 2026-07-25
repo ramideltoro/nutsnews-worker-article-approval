@@ -1,5 +1,6 @@
 import {
-  STAGE_PAYLOAD_SCHEMA_IDS
+  STAGE_PAYLOAD_SCHEMA_IDS,
+  WORKER_DELIVERY_BEHAVIOR
 } from "@ramideltoro/nutsnews-worker-contracts";
 import {
   createBufferedRuntimeTelemetrySink
@@ -345,13 +346,225 @@ describe("createArticleApprovalWorkHandler", () => {
     expect(context.outbox.records).toHaveLength(1);
     expect(context.telemetry.events.some((event) => event.attributes?.reusedDecision === true)).toBe(true);
   });
+
+  it("limits parallel Qwen calls while queued deliveries wait for capacity", async () => {
+    const context = createApprovalContext({
+      NUTSNEWS_APPROVAL_CONCURRENCY: "2",
+      NUTSNEWS_APPROVAL_PREFETCH: "2",
+      NUTSNEWS_APPROVAL_QWEN_MAX_PARALLEL_CALLS: "1",
+      NUTSNEWS_APPROVAL_QWEN_MAX_QUEUED_CALLS: "1"
+    });
+    const gate = deferred<undefined>();
+    const firstReviewStarted = deferred<undefined>();
+    let reviewStarts = 0;
+
+    context.qwenClient.reviewGate = gate.promise;
+    context.qwenClient.onReviewStart = () => {
+      reviewStarts += 1;
+
+      if (reviewStarts === 1) {
+        firstReviewStarted.resolve(undefined);
+      }
+    };
+
+    await context.service.start();
+    const first = context.broker.deliverApproval(createArticleDelivery(101, 1));
+
+    await firstReviewStarted.promise;
+
+    const second = context.broker.deliverApproval(createArticleDelivery(102, 2));
+
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(context.qwenClient.activeRequests).toBe(1);
+    expect(context.qwenClient.requests).toHaveLength(1);
+
+    gate.resolve(undefined);
+
+    await expect(first).resolves.toMatchObject({
+      action: "ack",
+      reason: "handled"
+    });
+    await expect(second).resolves.toMatchObject({
+      action: "ack",
+      reason: "handled"
+    });
+    await context.service.stop();
+
+    expect(context.qwenClient.requests).toHaveLength(2);
+    expect(context.qwenClient.maxActiveRequests).toBe(1);
+    expect(context.broker.published).toHaveLength(2);
+  });
+
+  it("returns bounded retries when Qwen capacity is saturated", async () => {
+    const context = createApprovalContext({
+      NUTSNEWS_APPROVAL_CONCURRENCY: "2",
+      NUTSNEWS_APPROVAL_PREFETCH: "2",
+      NUTSNEWS_APPROVAL_QWEN_MAX_PARALLEL_CALLS: "1",
+      NUTSNEWS_APPROVAL_QWEN_MAX_QUEUED_CALLS: "0",
+      NUTSNEWS_APPROVAL_QWEN_BACKPRESSURE_RETRY_AFTER_MS: "9000"
+    });
+    const gate = deferred<undefined>();
+    const firstReviewStarted = deferred<undefined>();
+
+    context.qwenClient.reviewGate = gate.promise;
+    context.qwenClient.onReviewStart = () => {
+      firstReviewStarted.resolve(undefined);
+    };
+
+    await context.service.start();
+    const first = context.broker.deliverApproval(createArticleDelivery(201, 1));
+
+    await firstReviewStarted.promise;
+
+    await expect(context.broker.deliverApproval(createArticleDelivery(202, 2))).resolves.toMatchObject({
+      action: "retry",
+      reason: "qwen-backpressure",
+      retryAfterMs: 9_000
+    });
+
+    expect(context.qwenClient.requests).toHaveLength(1);
+
+    gate.resolve(undefined);
+
+    await expect(first).resolves.toMatchObject({
+      action: "ack",
+      reason: "handled"
+    });
+    await context.service.stop();
+  });
+
+  it("retries Qwen rate limits as an approved transient condition", async () => {
+    const context = createApprovalContext();
+
+    context.qwenClient.error = new ApprovalQwenError("qwen-rate-limited", {
+      retryable: true,
+      retryAfterMs: 60_000
+    });
+
+    await context.service.start();
+
+    await expect(context.broker.deliverApproval()).resolves.toMatchObject({
+      action: "retry",
+      reason: "qwen-rate-limited",
+      retryAfterMs: 60_000
+    });
+
+    await context.service.stop();
+
+    expect(context.stateStore.decisions).toHaveLength(0);
+    expect(context.broker.published).toHaveLength(0);
+  });
+
+  it("does not retry unauthorized Qwen errors even when misclassified as retryable", async () => {
+    const context = createApprovalContext();
+
+    context.qwenClient.error = new ApprovalQwenError("qwen-unauthorized", {
+      retryable: true
+    });
+
+    await context.service.start();
+
+    await expect(context.broker.deliverApproval()).resolves.toMatchObject({
+      action: "ack",
+      reason: "handled"
+    });
+
+    await context.service.stop();
+
+    expect(context.stateStore.decisions[0]).toMatchObject({
+      decision: "permanent_failure",
+      rejectionReason: "qwen-unauthorized"
+    });
+    expect(context.broker.published).toHaveLength(0);
+  });
+
+  it("DLQs repeated transient Qwen failures after retry attempts are exhausted", async () => {
+    const context = createApprovalContext();
+
+    context.qwenClient.error = new ApprovalQwenError("qwen-timeout", {
+      retryable: true,
+      retryAfterMs: 5_000
+    });
+
+    await context.service.start();
+
+    await expect(context.broker.deliverApproval({
+      ...createArticleDelivery(301, 1),
+      envelope: createMinimalApprovalEnvelope({
+        messageId: messageIdFor(1),
+        idempotencyKey: "enrichment:approval:article-301:fingerprint-301:1",
+        aggregate: {
+          type: "article",
+          id: "article-301",
+          version: 1
+        },
+        attempt: {
+          count: WORKER_DELIVERY_BEHAVIOR.maxAttempts,
+          max: WORKER_DELIVERY_BEHAVIOR.maxAttempts,
+          firstAttemptAt: "2026-07-23T00:00:00.000Z"
+        }
+      })
+    })).resolves.toMatchObject({
+      action: "dlq",
+      reason: "qwen-timeout"
+    });
+
+    await context.service.stop();
+
+    expect(context.stateStore.decisions).toHaveLength(0);
+    expect(context.broker.published).toHaveLength(0);
+  });
+
+  it("recovers a recorded decision after publish failure without another Qwen call", async () => {
+    const context = createApprovalContext();
+
+    context.broker.publishError = new Error("publish unavailable");
+
+    await context.service.start();
+
+    await expect(context.broker.deliverApproval(createArticleDelivery(401, 1))).resolves.toMatchObject({
+      action: "retry",
+      reason: "handler-error"
+    });
+
+    expect(context.qwenClient.requests).toHaveLength(1);
+    expect(context.stateStore.decisions).toHaveLength(1);
+    expect(context.stateStore.decisions[0]?.translationPublication).toBeUndefined();
+    expect(context.broker.published).toHaveLength(0);
+
+    await context.service.stop();
+
+    context.broker.publishError = undefined;
+    context.qwenClient.error = new Error("Qwen should not be called after decision persistence.");
+    const restartedService = createApprovalService({
+      config: context.config,
+      dependencies: context.dependencies,
+      telemetry: context.telemetry
+    });
+
+    await restartedService.start();
+
+    await expect(context.broker.deliverApproval(createArticleDelivery(401, 2))).resolves.toMatchObject({
+      action: "ack",
+      reason: "handled"
+    });
+
+    await restartedService.stop();
+
+    expect(context.qwenClient.requests).toHaveLength(1);
+    expect(context.broker.published).toHaveLength(1);
+    expect(context.stateStore.decisions[0]?.translationPublication).toBeDefined();
+  });
 });
 
-function createApprovalContext() {
+function createApprovalContext(env: NodeJS.ProcessEnv = {}) {
   const clock = new ManualApprovalClock();
   const config = loadApprovalConfig({
     NUTSNEWS_APPROVAL_HTTP_PORT: "0",
-    NUTSNEWS_APPROVAL_TELEMETRY_LOGS: "silent"
+    NUTSNEWS_APPROVAL_TELEMETRY_LOGS: "silent",
+    ...env
   });
   const baseDependencies = createLocalApprovalDependencies({
     clock
@@ -374,6 +587,7 @@ function createApprovalContext() {
   return {
     broker: dependencies.brokerTransport as LocalBrokerTransport,
     config,
+    dependencies,
     outbox: dependencies.brokerOutbox as LocalApprovalBrokerOutbox,
     qwenClient: dependencies.qwenClient as LocalApprovalQwenClient,
     service,
@@ -386,4 +600,62 @@ function withoutImageUrl(payload: Readonly<Record<string, unknown>>): Readonly<R
   const entries = Object.entries(payload).filter(([key]) => key !== "imageUrl");
 
   return Object.fromEntries(entries);
+}
+
+function createArticleDelivery(articleNumber: number, deliveryNumber: number) {
+  const articleId = `article-${String(articleNumber)}`;
+  const candidateId = `candidate-${String(articleNumber)}`;
+  const fingerprint = `fingerprint-${String(articleNumber)}`;
+  const idempotencyKey = `enrichment:approval:${articleId}:${fingerprint}:${String(deliveryNumber)}`;
+  const sourceMessageId = messageIdFor(deliveryNumber + 100);
+
+  return {
+    envelope: createMinimalApprovalEnvelope({
+      messageId: messageIdFor(deliveryNumber),
+      causationId: sourceMessageId,
+      idempotencyKey,
+      aggregate: {
+        type: "article",
+        id: articleId,
+        version: 1
+      }
+    }),
+    payload: createMinimalApprovalPayload({
+      sourceMessageId,
+      idempotencyKey,
+      candidateId,
+      canonicalUrl: `https://articles.example.test/world/story-${String(articleNumber)}`,
+      articleMetadataRef: {
+        kind: "backend-record",
+        uri: `backend://worker-uplift/enrichment/${articleId}/${fingerprint}`,
+        mediaType: "application/json",
+        contentFingerprint: fingerprint,
+        canonicalArticleId: articleId,
+        articleVersion: 1,
+        title: `Synthetic approval story ${String(articleNumber)}`,
+        description: "A sanitized parity-style metadata description for approval recovery tests.",
+        language: "en"
+      }
+    }),
+    receivedAt: "2026-07-23T00:00:01.000Z"
+  };
+}
+
+function messageIdFor(index: number): string {
+  return `018f1598-2dd5-7c4f-9f92-8f7a7f8b${String(5_000 + index).slice(-4)}`;
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+
+  return {
+    promise,
+    resolve,
+    reject
+  };
 }

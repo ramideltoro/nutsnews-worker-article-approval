@@ -20,6 +20,12 @@ import { createApprovalService } from "./service.js";
 import { createLocalApprovalDependencies } from "./test-doubles.js";
 
 export {
+  InMemoryApprovalQwenCapacityLimiter,
+  type ApprovalQwenCapacityLimiter,
+  type ApprovalQwenCapacityLimiterOptions,
+  type ApprovalQwenCapacityPermit
+} from "./backpressure.js";
+export {
   APPROVAL_CONFIG_SCHEMA,
   APPROVAL_SERVICE_NAME,
   APPROVAL_SERVICE_VERSION,

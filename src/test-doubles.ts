@@ -232,6 +232,8 @@ export class LocalApprovalQwenClient implements ApprovalQwenClient {
   readonly name: string = "local-qwen-client";
   status: ApprovalDependencyProbe["status"] = "ok";
   readonly requests: ApprovalQwenRequest[] = [];
+  activeRequests = 0;
+  maxActiveRequests = 0;
   response: unknown = {
     decision: "accepted",
     reasonCode: "newsworthy",
@@ -247,6 +249,8 @@ export class LocalApprovalQwenClient implements ApprovalQwenClient {
     }
   };
   error: unknown;
+  reviewGate: Promise<unknown> | undefined;
+  onReviewStart: (() => void) | undefined;
 
   probe(): ApprovalDependencyProbe {
     return {
@@ -255,16 +259,25 @@ export class LocalApprovalQwenClient implements ApprovalQwenClient {
     };
   }
 
-  review(request: ApprovalQwenRequest): Promise<unknown> {
+  async review(request: ApprovalQwenRequest): Promise<unknown> {
     this.requests.push(request);
+    this.activeRequests += 1;
+    this.maxActiveRequests = Math.max(this.maxActiveRequests, this.activeRequests);
+    this.onReviewStart?.();
 
-    if (this.error !== undefined) {
-      const reason = typeof this.error === "string" ? this.error : "local Qwen fixture error";
+    try {
+      await this.reviewGate;
 
-      return Promise.reject(this.error instanceof Error ? this.error : new Error(reason));
+      if (this.error !== undefined) {
+        const reason = typeof this.error === "string" ? this.error : "local Qwen fixture error";
+
+        throw this.error instanceof Error ? this.error : new Error(reason);
+      }
+
+      return this.response;
+    } finally {
+      this.activeRequests = Math.max(0, this.activeRequests - 1);
     }
-
-    return Promise.resolve(this.response);
   }
 }
 
@@ -318,6 +331,7 @@ export class LocalBrokerTransport implements RuntimeBrokerTransport {
   readonly inFlightDeliveryCount = 0;
   readonly assertedRoutes: WorkerRoute[] = [];
   readonly published: BrokerPublishCommand[] = [];
+  publishError: Error | undefined;
   private connected = false;
   private readonly consumers = new Map<WorkerStage, BrokerDeliveryHandler>();
 
@@ -334,6 +348,11 @@ export class LocalBrokerTransport implements RuntimeBrokerTransport {
 
   publish(command: BrokerPublishCommand): Promise<BrokerPublishReceipt> {
     this.assertConnected();
+
+    if (this.publishError !== undefined) {
+      return Promise.reject(this.publishError);
+    }
+
     this.published.push(command);
     const route = getWorkerRoute(command.envelope.route);
 

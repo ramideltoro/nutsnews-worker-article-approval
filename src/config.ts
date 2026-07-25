@@ -30,8 +30,16 @@ export const APPROVAL_CONFIG_SCHEMA = [
   variable("NUTSNEWS_APPROVAL_PREFETCH", "Broker prefetch bound for approval deliveries.", false, false, "4"),
   variable("NUTSNEWS_APPROVAL_QWEN_TOTAL_TIMEOUT_MS", "Maximum approval endpoint call timeout in milliseconds.", false, false, "30000"),
   variable("NUTSNEWS_APPROVAL_QWEN_MAX_INPUT_BYTES", "Maximum prompt input reference size accepted by approval.", false, false, "32768"),
+  variable("NUTSNEWS_APPROVAL_QWEN_MAX_PARALLEL_CALLS", "Maximum concurrent Qwen calls allowed per worker process.", false, false, "1"),
+  variable("NUTSNEWS_APPROVAL_QWEN_MAX_QUEUED_CALLS", "Maximum in-process approval deliveries allowed to wait for Qwen capacity.", false, false, "3"),
+  variable("NUTSNEWS_APPROVAL_QWEN_BACKPRESSURE_RETRY_AFTER_MS", "Retry delay returned when Qwen capacity is saturated.", false, false, "5000"),
   variable("NUTSNEWS_APPROVAL_SUMMARY_MIN_CHARS", "Minimum accepted source summary length.", false, false, "40"),
   variable("NUTSNEWS_APPROVAL_SUMMARY_MAX_CHARS", "Maximum accepted source summary length.", false, false, "600"),
+  variable("NUTSNEWS_APPROVAL_OPENAI_FALLBACK_ENABLED", "Protected flag for legacy OpenAI fallback. Default false.", false, false, "false"),
+  variable("NUTSNEWS_APPROVAL_OPENAI_FALLBACK_PROTECTED_FLAG", "Operator confirmation required before legacy OpenAI fallback can run.", false, false, "false"),
+  variable("NUTSNEWS_APPROVAL_OPENAI_FALLBACK_BUDGET_USD", "Maximum approved OpenAI fallback budget in USD.", false, false, "0"),
+  variable("NUTSNEWS_APPROVAL_OPENAI_FALLBACK_PROVENANCE_MARKER", "Required provenance marker for any fallback decision.", false, false, ""),
+  variable("NUTSNEWS_APPROVAL_OPENAI_FALLBACK_ALERT_TOPIC", "Required alert topic or route when fallback is enabled.", false, false, ""),
   variable("NUTSNEWS_APPROVAL_SHUTDOWN_TIMEOUT_MS", "Graceful shutdown drain timeout in milliseconds.", false, false, "30000"),
   variable("NUTSNEWS_APPROVAL_SHADOW_MODE", "Keep approval output isolated from legacy ingestion.", false, false, "true"),
   variable("NUTSNEWS_APPROVAL_TELEMETRY_LOGS", "Structured runtime log sink mode.", false, false, "stdout"),
@@ -59,11 +67,21 @@ export interface ApprovalConfig {
     readonly promptId: string;
     readonly totalTimeoutMs: number;
     readonly maxInputBytes: number;
+    readonly maxParallelCalls: number;
+    readonly maxQueuedCalls: number;
+    readonly backpressureRetryAfterMs: number;
   };
   readonly targetLanguages: readonly string[];
   readonly summary: {
     readonly minChars: number;
     readonly maxChars: number;
+  };
+  readonly openAiFallback: {
+    readonly enabled: boolean;
+    readonly protectedFlag: boolean;
+    readonly budgetUsd: number;
+    readonly provenanceMarker: string;
+    readonly alertTopic: string;
   };
   readonly concurrency: number;
   readonly prefetch: number;
@@ -117,12 +135,22 @@ export function loadApprovalConfig(env: NodeJS.ProcessEnv = process.env): Approv
       model: nonEmpty(env.NUTSNEWS_APPROVAL_QWEN_MODEL, "qwen2.5:3b"),
       promptId: nonEmpty(env.NUTSNEWS_APPROVAL_PROMPT_ID, "editorial-approval-v1"),
       totalTimeoutMs: parseInteger(env.NUTSNEWS_APPROVAL_QWEN_TOTAL_TIMEOUT_MS, "NUTSNEWS_APPROVAL_QWEN_TOTAL_TIMEOUT_MS", 30_000, 1_000, 180_000, issues),
-      maxInputBytes: parseInteger(env.NUTSNEWS_APPROVAL_QWEN_MAX_INPUT_BYTES, "NUTSNEWS_APPROVAL_QWEN_MAX_INPUT_BYTES", 32_768, 1_024, 1_048_576, issues)
+      maxInputBytes: parseInteger(env.NUTSNEWS_APPROVAL_QWEN_MAX_INPUT_BYTES, "NUTSNEWS_APPROVAL_QWEN_MAX_INPUT_BYTES", 32_768, 1_024, 1_048_576, issues),
+      maxParallelCalls: parseInteger(env.NUTSNEWS_APPROVAL_QWEN_MAX_PARALLEL_CALLS, "NUTSNEWS_APPROVAL_QWEN_MAX_PARALLEL_CALLS", 1, 1, 16, issues),
+      maxQueuedCalls: parseInteger(env.NUTSNEWS_APPROVAL_QWEN_MAX_QUEUED_CALLS, "NUTSNEWS_APPROVAL_QWEN_MAX_QUEUED_CALLS", 3, 0, 64, issues),
+      backpressureRetryAfterMs: parseInteger(env.NUTSNEWS_APPROVAL_QWEN_BACKPRESSURE_RETRY_AFTER_MS, "NUTSNEWS_APPROVAL_QWEN_BACKPRESSURE_RETRY_AFTER_MS", 5_000, 1_000, 600_000, issues)
     },
     targetLanguages: parseList(env.NUTSNEWS_APPROVAL_TARGET_LANGUAGES, "NUTSNEWS_APPROVAL_TARGET_LANGUAGES", "fr,ja,de-CH,de,el", issues),
     summary: {
       minChars: parseInteger(env.NUTSNEWS_APPROVAL_SUMMARY_MIN_CHARS, "NUTSNEWS_APPROVAL_SUMMARY_MIN_CHARS", 40, 1, 1_000, issues),
       maxChars: parseInteger(env.NUTSNEWS_APPROVAL_SUMMARY_MAX_CHARS, "NUTSNEWS_APPROVAL_SUMMARY_MAX_CHARS", 600, 40, 4_000, issues)
+    },
+    openAiFallback: {
+      enabled: parseBoolean(env.NUTSNEWS_APPROVAL_OPENAI_FALLBACK_ENABLED, "NUTSNEWS_APPROVAL_OPENAI_FALLBACK_ENABLED", false, issues),
+      protectedFlag: parseBoolean(env.NUTSNEWS_APPROVAL_OPENAI_FALLBACK_PROTECTED_FLAG, "NUTSNEWS_APPROVAL_OPENAI_FALLBACK_PROTECTED_FLAG", false, issues),
+      budgetUsd: parseMoney(env.NUTSNEWS_APPROVAL_OPENAI_FALLBACK_BUDGET_USD, "NUTSNEWS_APPROVAL_OPENAI_FALLBACK_BUDGET_USD", 0, 0, 10_000, issues),
+      provenanceMarker: nonEmpty(env.NUTSNEWS_APPROVAL_OPENAI_FALLBACK_PROVENANCE_MARKER, ""),
+      alertTopic: nonEmpty(env.NUTSNEWS_APPROVAL_OPENAI_FALLBACK_ALERT_TOPIC, "")
     },
     concurrency,
     prefetch,
@@ -142,6 +170,32 @@ export function loadApprovalConfig(env: NodeJS.ProcessEnv = process.env): Approv
 
   if (config.summary.maxChars < config.summary.minChars) {
     issues.push("NUTSNEWS_APPROVAL_SUMMARY_MAX_CHARS must be greater than or equal to NUTSNEWS_APPROVAL_SUMMARY_MIN_CHARS.");
+  }
+
+  if (config.qwen.maxParallelCalls > config.concurrency) {
+    issues.push("NUTSNEWS_APPROVAL_QWEN_MAX_PARALLEL_CALLS must be less than or equal to NUTSNEWS_APPROVAL_CONCURRENCY.");
+  }
+
+  if (config.qwen.maxParallelCalls + config.qwen.maxQueuedCalls > config.prefetch) {
+    issues.push("NUTSNEWS_APPROVAL_QWEN_MAX_PARALLEL_CALLS plus NUTSNEWS_APPROVAL_QWEN_MAX_QUEUED_CALLS must be less than or equal to NUTSNEWS_APPROVAL_PREFETCH.");
+  }
+
+  if (config.openAiFallback.enabled) {
+    if (!config.openAiFallback.protectedFlag) {
+      issues.push("NUTSNEWS_APPROVAL_OPENAI_FALLBACK_PROTECTED_FLAG must be true when fallback is enabled.");
+    }
+
+    if (config.openAiFallback.budgetUsd <= 0) {
+      issues.push("NUTSNEWS_APPROVAL_OPENAI_FALLBACK_BUDGET_USD must be greater than 0 when fallback is enabled.");
+    }
+
+    if (config.openAiFallback.provenanceMarker !== "legacy_openai_fallback") {
+      issues.push("NUTSNEWS_APPROVAL_OPENAI_FALLBACK_PROVENANCE_MARKER must be legacy_openai_fallback when fallback is enabled.");
+    }
+
+    if (config.openAiFallback.alertTopic.length === 0) {
+      issues.push("NUTSNEWS_APPROVAL_OPENAI_FALLBACK_ALERT_TOPIC is required when fallback is enabled.");
+    }
   }
 
   if (issues.length > 0) {
@@ -253,6 +307,28 @@ function parseInteger(
   }
 
   return parsed;
+}
+
+function parseMoney(
+  value: string | undefined,
+  key: string,
+  fallback: number,
+  min: number,
+  max: number,
+  issues: string[]
+): number {
+  if (!hasValue(value)) {
+    return fallback;
+  }
+
+  const parsed = Number(value);
+
+  if (!Number.isFinite(parsed) || parsed < min || parsed > max) {
+    issues.push(`${key} must be a decimal number between ${String(min)} and ${String(max)}.`);
+    return fallback;
+  }
+
+  return Math.round(parsed * 100) / 100;
 }
 
 function parseList(value: string | undefined, key: string, fallback: string, issues: string[]): readonly string[] {

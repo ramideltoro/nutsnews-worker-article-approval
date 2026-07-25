@@ -211,7 +211,7 @@ export interface ApprovalQwenRequest {
 }
 
 export class ApprovalQwenError extends Error {
-  readonly reason: "qwen-timeout" | "qwen-unauthorized" | "qwen-model-error";
+  readonly reason: "qwen-timeout" | "qwen-rate-limited" | "qwen-unauthorized" | "qwen-model-error";
   readonly retryable: boolean;
   readonly retryAfterMs: number | undefined;
 
