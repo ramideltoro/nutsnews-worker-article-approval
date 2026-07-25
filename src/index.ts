@@ -14,8 +14,10 @@ import {
   loadApprovalConfig,
   type ApprovalConfig
 } from "./config.js";
+import type { ApprovalDependencies } from "./dependencies.js";
 import { createArticleApprovalWorkHandler } from "./approval.js";
 import { createApprovalHttpServer } from "./http.js";
+import { createProductionApprovalDependencies } from "./production.js";
 import { createApprovalService } from "./service.js";
 import { createLocalApprovalDependencies } from "./test-doubles.js";
 
@@ -65,6 +67,16 @@ export {
   type ApprovalHttpServer
 } from "./http.js";
 export {
+  LocalAiApprovalQwenClient,
+  PayloadRabbitMqTransport,
+  PostgresApprovalBrokerOutbox,
+  PostgresApprovalStateStore,
+  PostgresApprovalTransactionRunner,
+  StaticApprovalPromptRegistry,
+  createProductionApprovalDependencies,
+  type ProductionApprovalDependencies
+} from "./production.js";
+export {
   createApprovalService,
   type ApprovalService
 } from "./service.js";
@@ -110,9 +122,17 @@ export function createApprovalApplication(config = loadApprovalConfig()): Approv
       })
     : undefined;
   const telemetry = combineTelemetrySinks(logSink, metrics);
-  const baseDependencies = createLocalApprovalDependencies({
-    clock: SYSTEM_RUNTIME_CLOCK
-  });
+  const baseDependencies = config.dependencyMode === "production"
+    ? createProductionApprovalDependencies({
+        config,
+        clock: SYSTEM_RUNTIME_CLOCK,
+        ...(telemetry === undefined ? {} : {
+          telemetry
+        })
+      })
+    : createLocalApprovalDependencies({
+        clock: SYSTEM_RUNTIME_CLOCK
+      });
   const dependencies = {
     ...baseDependencies,
     workHandler: createArticleApprovalWorkHandler({
@@ -147,6 +167,11 @@ export function createApprovalApplication(config = loadApprovalConfig()): Approv
       },
       async () => {
         await service.stop();
+      },
+      async () => {
+        if (hasDependencyCloser(baseDependencies)) {
+          await baseDependencies.close();
+        }
       }
     ],
     signalSource: process,
@@ -171,6 +196,14 @@ export function createApprovalApplication(config = loadApprovalConfig()): Approv
       await shutdown.trigger("manual");
     }
   };
+}
+
+function hasDependencyCloser(
+  dependencies: ApprovalDependencies
+): dependencies is ApprovalDependencies & { readonly close: () => Promise<void> } {
+  const candidate = dependencies as Partial<{ readonly close: unknown }>;
+
+  return typeof candidate.close === "function";
 }
 
 function combineTelemetrySinks(
