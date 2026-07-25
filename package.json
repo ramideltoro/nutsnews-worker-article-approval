@@ -32,11 +32,12 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "lint": "eslint .",
     "test": "vitest run",
+    "approval:evals": "vitest run test/approval-evals.test.ts",
     "test:integration": "vitest run --config vitest.integration.config.ts",
     "sbom": "npm sbom --sbom-format=cyclonedx > nutsnews-worker-article-approval.sbom.json",
     "audit:prod": "npm audit --omit=dev --audit-level=high",
     "container:build": "docker build --pull=false --secret id=npm_token,env=NODE_AUTH_TOKEN -t nutsnews-worker-article-approval:local .",
-    "ci": "npm run lint && npm run typecheck && npm run test && npm run test:integration && npm run build && npm run sbom && npm run audit:prod"
+    "ci": "npm run lint && npm run typecheck && npm run test && npm run approval:evals && npm run test:integration && npm run build && npm run sbom && npm run audit:prod"
   },
   "dependencies": {
     "@ramideltoro/nutsnews-worker-contracts": "0.4.0",

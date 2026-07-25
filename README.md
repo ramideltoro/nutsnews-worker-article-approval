@@ -13,10 +13,12 @@ This service uses a versioned editorial prompt with the configured Qwen-compatib
 - Consumes the contracted `approval` route and asserts the downstream `translation` route for future publish work.
 - Accepts payload schemas whose contract consumer is `approval`, including enrichment-produced `enrichmentResult` messages.
 - Loads the bounded enrichment metadata record by reference, rejects missing-thumbnail inputs before model review, and calls Qwen only for hydrated article candidates.
+- Limits in-process Qwen calls by configured per-worker capacity, queues only up to the RabbitMQ prefetch bound, and returns bounded retries when saturated.
 - Validates accepted/rejected model responses, bounded scores, sanitized reason codes, and accepted source summaries before recording a decision.
 - Stores article, message, prompt, model, trace, latency, token, review, and summary references without logging prompt bodies, credentials, or unrestricted model output.
 - Reuses recorded decisions for the same article version, prompt version, and model, so delivery replays do not duplicate Qwen calls or translation publishes.
 - Publishes contracted `translationTask` messages only when the stored decision is accepted and has not already been published downstream.
+- Keeps legacy OpenAI fallback disabled unless an explicit protected flag, nonzero budget, provenance marker, and alert topic are all configured.
 - Uses shared runtime broker lifecycle, in-flight drain, idempotency store, retry/DLQ destinations, health reports, and Prometheus metrics.
 - Keeps liveness independent from Qwen readiness; `/live` only checks process health, while `/ready` gates broker, state, outbox, Qwen, prompt registry, and shadow mode.
 
@@ -35,8 +37,16 @@ The HTTP server exposes `/config-schema` with names, defaults, sensitivity, and 
 | `NUTSNEWS_APPROVAL_TARGET_LANGUAGES` | `fr,ja,de-CH,de,el` | optional | no |
 | `NUTSNEWS_APPROVAL_QWEN_TOTAL_TIMEOUT_MS` | `30000` | optional | no |
 | `NUTSNEWS_APPROVAL_QWEN_MAX_INPUT_BYTES` | `32768` | optional | no |
+| `NUTSNEWS_APPROVAL_QWEN_MAX_PARALLEL_CALLS` | `1` | optional | no |
+| `NUTSNEWS_APPROVAL_QWEN_MAX_QUEUED_CALLS` | `3` | optional | no |
+| `NUTSNEWS_APPROVAL_QWEN_BACKPRESSURE_RETRY_AFTER_MS` | `5000` | optional | no |
 | `NUTSNEWS_APPROVAL_SUMMARY_MIN_CHARS` | `40` | optional | no |
 | `NUTSNEWS_APPROVAL_SUMMARY_MAX_CHARS` | `600` | optional | no |
+| `NUTSNEWS_APPROVAL_OPENAI_FALLBACK_ENABLED` | `false` | optional | no |
+| `NUTSNEWS_APPROVAL_OPENAI_FALLBACK_PROTECTED_FLAG` | `false` | required if fallback enabled | no |
+| `NUTSNEWS_APPROVAL_OPENAI_FALLBACK_BUDGET_USD` | `0` | required if fallback enabled | no |
+| `NUTSNEWS_APPROVAL_OPENAI_FALLBACK_PROVENANCE_MARKER` | unset | must be `legacy_openai_fallback` if fallback enabled | no |
+| `NUTSNEWS_APPROVAL_OPENAI_FALLBACK_ALERT_TOPIC` | unset | required if fallback enabled | no |
 | `NUTSNEWS_APPROVAL_CONCURRENCY` | `2` | optional | no |
 | `NUTSNEWS_APPROVAL_PREFETCH` | `4` | optional | no |
 | `NUTSNEWS_APPROVAL_SHADOW_MODE` | `true` | must remain true here | no |
@@ -49,7 +59,7 @@ npm run ci
 NODE_AUTH_TOKEN=<github-packages-token> npm run container:build
 ```
 
-`npm run ci` runs lint, typecheck, unit tests, integration tests, build, SBOM generation, and a production dependency audit.
+`npm run ci` runs lint, typecheck, unit tests, the approval eval corpus, integration tests, build, SBOM generation, and a production dependency audit. The Dockerfile build stage also runs `npm run ci`, so published images are gated by the eval thresholds.
 
 ## Owner
 

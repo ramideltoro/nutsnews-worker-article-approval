@@ -16,6 +16,10 @@ import {
   type RuntimeTelemetrySink
 } from "@ramideltoro/nutsnews-worker-runtime";
 
+import {
+  InMemoryApprovalQwenCapacityLimiter,
+  type ApprovalQwenCapacityLimiter
+} from "./backpressure.js";
 import type { ApprovalConfig } from "./config.js";
 import {
   ApprovalQwenError,
@@ -36,6 +40,7 @@ export interface ArticleApprovalWorkHandlerOptions {
   readonly config: ApprovalConfig;
   readonly dependencies: ApprovalDependencies;
   readonly telemetry?: RuntimeTelemetrySink;
+  readonly qwenLimiter?: ApprovalQwenCapacityLimiter;
 }
 
 interface QwenDecisionBase {
@@ -79,9 +84,17 @@ const SUMMARY_UNSAFE_RE = /bearer |api_key=|apikey=|token=|secret=|password=|pri
 const REASON_CODE_RE = /^[a-z][a-z0-9_-]{1,79}$/u;
 
 export function createArticleApprovalWorkHandler(options: ArticleApprovalWorkHandlerOptions): ApprovalWorkHandler {
+  const qwenLimiter = options.qwenLimiter ?? new InMemoryApprovalQwenCapacityLimiter({
+    maxParallelCalls: options.config.qwen.maxParallelCalls,
+    maxQueuedCalls: options.config.qwen.maxQueuedCalls
+  });
+
   return {
     name: "article-approval-work-handler",
-    handle: (context, tools) => handleApproval(context, tools, options)
+    handle: (context, tools) => handleApproval(context, tools, {
+      ...options,
+      qwenLimiter
+    })
   };
 }
 
@@ -168,13 +181,26 @@ async function modelDecision(
     };
   }
 
+  const permit = await options.qwenLimiter?.acquire();
+
+  if (permit === undefined) {
+    return {
+      status: "runtime",
+      result: {
+        status: "retry",
+        reason: "qwen-backpressure",
+        retryAfterMs: options.config.qwen.backpressureRetryAfterMs
+      }
+    };
+  }
+
   const startedAtMs = options.dependencies.clock.now().getTime();
   let raw: unknown;
 
   try {
     raw = await options.dependencies.qwenClient.review(request);
   } catch (error: unknown) {
-    if (error instanceof ApprovalQwenError && error.retryable) {
+    if (isApprovedTransientQwenError(error)) {
       if (error.retryAfterMs === undefined) {
         return {
           status: "runtime",
@@ -208,6 +234,8 @@ async function modelDecision(
         decidedAt
       })
     };
+  } finally {
+    permit.release();
   }
 
   const validation = validateQwenDecision(raw, options.config, elapsedMs(options, startedAtMs));
@@ -779,6 +807,12 @@ function score(value: unknown): value is number {
 
 function nonNegativeInteger(value: unknown): value is number {
   return Number.isInteger(value) && typeof value === "number" && value >= 0;
+}
+
+function isApprovedTransientQwenError(error: unknown): error is ApprovalQwenError {
+  return error instanceof ApprovalQwenError
+    && error.retryable
+    && (error.reason === "qwen-timeout" || error.reason === "qwen-rate-limited" || error.reason === "qwen-model-error");
 }
 
 function imageStatusValue(value: unknown): ApprovalEnrichmentRecordInput["imageStatus"] {
