@@ -390,9 +390,14 @@ function legacyOutboxRow(
     confirmed_at: new Date("2026-07-22T23:00:02.000Z"),
     status: "confirmed",
     diagnostic_metadata: {
+      payload: reversePayloadInsertionOrder(payload),
       payloadSchemaId: STAGE_PAYLOAD_SCHEMA_IDS.translationTask
     }
   };
+}
+
+function reversePayloadInsertionOrder(payload: Readonly<Record<string, unknown>>): Readonly<Record<string, unknown>> {
+  return Object.fromEntries(Object.entries(payload).reverse());
 }
 
 function approvalDecisionRow(decision: ReturnType<typeof approvalDecisionSnapshot>): QueryResultRow {

@@ -999,8 +999,8 @@ export class PostgresApprovalOutboxReconciler implements ApprovalReconciler {
     const baseCandidate = candidateFromRow(row, "confirmed-outbox-replay");
     const diagnostic = objectValue(row.diagnostic_metadata);
     const reconstructed = await this.reconstructMissingCarrier(row, requestedAt);
-    const payload = diagnostic.payload ?? reconstructed.payload;
-    const envelope = diagnostic.envelope ?? reconstructed.envelope;
+    const payload = reconstructed.payload ?? diagnostic.payload;
+    const envelope = reconstructed.envelope ?? diagnostic.envelope;
 
     if (!isRecord(payload)) {
       return failedCandidate(baseCandidate, "missing-stored-payload");
