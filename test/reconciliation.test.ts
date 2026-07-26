@@ -28,12 +28,17 @@ import {
   PostgresApprovalBrokerOutbox,
   PostgresApprovalOutboxReconciler
 } from "../src/production.js";
+import { loadApprovalConfig } from "../src/config.js";
+import { stableUuid } from "../src/ids.js";
 import { APPROVAL_RECONCILIATION_CONFIRMATION } from "../src/reconciliation.js";
 
 const now = "2026-07-23T00:00:00.000Z";
 const clock = {
   now: () => new Date(now)
 };
+const config = loadApprovalConfig({
+  NUTSNEWS_APPROVAL_TARGET_LANGUAGES: "fr"
+});
 
 describe("approval outbox reconciliation", () => {
   it("records full envelope and payload so service-owned replay can hydrate payload_ref", async () => {
@@ -77,6 +82,7 @@ describe("approval outbox reconciliation", () => {
       pool: pool.asPool(),
       brokerTransport: transport,
       clock,
+      config,
       env: {}
     });
 
@@ -111,6 +117,7 @@ describe("approval outbox reconciliation", () => {
       pool: pool.asPool(),
       brokerTransport: transport,
       clock,
+      config,
       env: {
         NUTSNEWS_APPROVAL_RECONCILIATION_APPLY_ENABLED: "true"
       }
@@ -154,6 +161,7 @@ describe("approval outbox reconciliation", () => {
       pool: pool.asPool(),
       brokerTransport: transport,
       clock,
+      config,
       env: {
         NUTSNEWS_APPROVAL_RECONCILIATION_APPLY_ENABLED: "true"
       }
@@ -169,6 +177,46 @@ describe("approval outbox reconciliation", () => {
     expect(report.errors).toContain("1:missing-stored-envelope");
     expect(report.writesPerformed).toBe(false);
     expect(transport.published).toHaveLength(0);
+  });
+
+  it("hydrates legacy rows from approval decision snapshots when payload_ref and digest match", async () => {
+    const decision = approvalDecisionSnapshot();
+    const payload = translationPayloadFromDecision(decision);
+    const row = legacyOutboxRow(decision, payload);
+    const pool = new FakePool([
+      row
+    ], [
+      approvalDecisionRow(decision)
+    ]);
+    const transport = new FakeBrokerTransport();
+    const reconciler = new PostgresApprovalOutboxReconciler({
+      pool: pool.asPool(),
+      brokerTransport: transport,
+      clock,
+      config,
+      env: {
+        NUTSNEWS_APPROVAL_RECONCILIATION_APPLY_ENABLED: "true"
+      }
+    });
+
+    const report = await reconciler.reconcile({
+      mode: "apply",
+      runId: "recovery-20260723",
+      protectedConfirmation: APPROVAL_RECONCILIATION_CONFIRMATION
+    });
+
+    expect(report.status).toBe("applied");
+    expect(report.replayedCount).toBe(1);
+    expect(report.failedClosedCount).toBe(0);
+    expect(transport.published).toHaveLength(1);
+    const replay = transport.published[0];
+    expect(replay?.payload).toEqual(payload);
+    expect(replay?.envelope.messageId).not.toBe(row.outbox_message_id);
+    expect(replay?.envelope.idempotencyKey).toBe(row.idempotency_key);
+    expect(replay?.envelope.correlationId).toBe(decision.correlationId);
+    expect(replay?.envelope.causationId).toBe(decision.sourceMessageId);
+    expect(replay?.envelope.payloadRef.uri).toBe(row.payload_ref);
+    expect(pool.queries.some((query) => query.sql.includes("approval_decisions"))).toBe(true);
   });
 });
 
@@ -258,6 +306,114 @@ function outboxRow(command: BrokerPublishCommand): QueryResultRow {
   };
 }
 
+function approvalDecisionSnapshot() {
+  return {
+    decisionId: "96ad1cc7-6c44-562d-9206-16e29dd88744",
+    candidateId: "candidate-001",
+    canonicalArticleId: "article-001",
+    articleVersion: 1,
+    canonicalUrl: "https://example.com/article-001",
+    decision: "accepted",
+    provider: "local_ai",
+    model: "qwen2.5:3b",
+    promptId: "editorial-approval-v1",
+    promptVersion: "0.1.0",
+    positivityScore: 91,
+    confidenceScore: 87,
+    qualityScore: 83,
+    sourceLanguage: "en",
+    contentFingerprint: "fingerprint-001",
+    reviewRef: {
+      kind: "backend-record",
+      uri: "backend://worker-uplift/approval/article-001/reviews/96ad1cc7-6c44-562d-9206-16e29dd88744",
+      mediaType: "application/json",
+      decisionId: "96ad1cc7-6c44-562d-9206-16e29dd88744",
+      canonicalArticleId: "article-001",
+      articleVersion: 1,
+      promptId: "editorial-approval-v1",
+      promptVersion: "0.1.0",
+      model: "qwen2.5:3b",
+      traceparent: "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+      sourceMessageId: "018f1598-2dd5-7c4f-9f92-8f7a7f8b3403"
+    },
+    sourceMessageId: "018f1598-2dd5-7c4f-9f92-8f7a7f8b3403",
+    correlationId: "018f1598-2dd5-7c4f-9f92-8f7a7f8b3400",
+    traceparent: "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+    latencyMs: 125,
+    decidedAt: now
+  } as const;
+}
+
+function translationPayloadFromDecision(decision: ReturnType<typeof approvalDecisionSnapshot>): Readonly<Record<string, unknown>> {
+  return {
+    schemaId: STAGE_PAYLOAD_SCHEMA_IDS.translationTask,
+    schemaVersion: STAGE_PAYLOAD_SCHEMA_VERSION,
+    pipelineRunId: "018f1598-2dd5-7c4f-9f92-8f7a7f8b3401",
+    stageExecutionId: stableUuid([
+      "translation-stage-execution",
+      decision.decisionId
+    ]),
+    sourceMessageId: decision.sourceMessageId,
+    idempotencyKey: `approval:translation:${decision.decisionId}`,
+    traceparent: decision.traceparent,
+    producedAt: decision.decidedAt,
+    articleId: decision.canonicalArticleId,
+    sourceLanguage: decision.sourceLanguage,
+    targetLanguages: [
+      "fr"
+    ],
+    reason: "new_article",
+    existingLanguageCodes: []
+  };
+}
+
+function legacyOutboxRow(
+  decision: ReturnType<typeof approvalDecisionSnapshot>,
+  payload: Readonly<Record<string, unknown>>
+): QueryResultRow {
+  return {
+    id: "legacy-1",
+    outbox_message_id: "018f1598-2dd5-7c4f-9f92-8f7a7f8b3410",
+    pipeline_run_id: payload.pipelineRunId,
+    stage_execution_id: payload.stageExecutionId,
+    destination_stage: "translation",
+    routing_key: getWorkerRoute("translation").routingKey,
+    entity_kind: "article",
+    entity_id: decision.canonicalArticleId,
+    schema_version: 1,
+    operation_version: decision.articleVersion,
+    idempotency_key: payload.idempotencyKey,
+    payload_ref: `backend://worker-uplift/approval/${encodeURIComponent(decision.canonicalArticleId)}/${decision.decisionId}/translation-task`,
+    payload_digest: sha256Json(payload),
+    created_at: new Date("2026-07-22T23:00:00.000Z"),
+    published_at: new Date("2026-07-22T23:00:01.000Z"),
+    confirmed_at: new Date("2026-07-22T23:00:02.000Z"),
+    status: "confirmed",
+    diagnostic_metadata: {
+      payloadSchemaId: STAGE_PAYLOAD_SCHEMA_IDS.translationTask
+    }
+  };
+}
+
+function approvalDecisionRow(decision: ReturnType<typeof approvalDecisionSnapshot>): QueryResultRow {
+  return {
+    article_identity_hash: decision.canonicalArticleId,
+    approval_version: decision.articleVersion,
+    decision: "approved",
+    positivity_score: decision.positivityScore,
+    ai_provider: decision.provider,
+    ai_model: decision.model,
+    prompt_version: `${decision.promptId}:${decision.promptVersion}`,
+    model_version: decision.model,
+    model_metadata: {},
+    diagnostic_metadata: {
+      decisionId: decision.decisionId,
+      decisionSnapshot: decision
+    },
+    reviewed_at: new Date(decision.decidedAt)
+  };
+}
+
 function sha256Json(value: unknown): string {
   return `sha256:${createHash("sha256").update(JSON.stringify(value)).digest("hex")}`;
 }
@@ -275,7 +431,10 @@ function firstQuery(pool: FakePool): { readonly sql: string; readonly values: re
 class FakePool {
   readonly queries: { readonly sql: string; readonly values: readonly unknown[] }[] = [];
 
-  constructor(private readonly rows: readonly QueryResultRow[]) {}
+  constructor(
+    private readonly rows: readonly QueryResultRow[],
+    private readonly decisionRows: readonly QueryResultRow[] = []
+  ) {}
 
   asPool() {
     return this as never;
@@ -286,6 +445,13 @@ class FakePool {
       sql,
       values
     });
+
+    if (sql.includes("approval_decisions")) {
+      return Promise.resolve({
+        rows: [...this.decisionRows],
+        rowCount: this.decisionRows.length
+      });
+    }
 
     if (sql.trimStart().startsWith("SELECT")) {
       return Promise.resolve({

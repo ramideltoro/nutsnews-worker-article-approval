@@ -2,7 +2,10 @@ import { createHash, randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 
 import {
+  STAGE_PAYLOAD_SCHEMA_IDS,
+  STAGE_PAYLOAD_SCHEMA_VERSION,
   WORKER_DELIVERY_BEHAVIOR,
+  getStagePayloadSizeBytes,
   getWorkerRoute,
   validateStagePayload,
   validateWorkerEnvelope,
@@ -135,7 +138,8 @@ export function createProductionApprovalDependencies(
     pool,
     brokerTransport,
     clock: options.clock,
-    env
+    env,
+    config: options.config
   });
   const reconciliationToken = reconciliationTokenFromEnv(env);
   const qwenClient = new LocalAiApprovalQwenClient({
@@ -815,6 +819,7 @@ interface ApprovalOutboxReconcilerOptions {
   readonly brokerTransport: RuntimeBrokerTransport;
   readonly clock: RuntimeClock;
   readonly env: NodeJS.ProcessEnv;
+  readonly config: ApprovalConfig;
 }
 
 interface ApprovalOutboxRow extends QueryResultRow {
@@ -894,7 +899,7 @@ export class PostgresApprovalOutboxReconciler implements ApprovalReconciler {
     }
 
     const rows = await this.selectCandidates(maxItems, minAgeSeconds, runId);
-    const hydrated = rows.map((row) => this.hydrate(row, requestedAt));
+    const hydrated = await Promise.all(rows.map((row) => this.hydrate(row, requestedAt)));
     const failed = hydrated.filter((candidate): candidate is ApprovalReconciliationCandidate => "status" in candidate);
 
     if (failed.length > 0) {
@@ -990,11 +995,12 @@ export class PostgresApprovalOutboxReconciler implements ApprovalReconciler {
     return result.rows;
   }
 
-  private hydrate(row: ApprovalOutboxRow, requestedAt: string): HydratedReplay | ApprovalReconciliationCandidate {
+  private async hydrate(row: ApprovalOutboxRow, requestedAt: string): Promise<HydratedReplay | ApprovalReconciliationCandidate> {
     const baseCandidate = candidateFromRow(row, "confirmed-outbox-replay");
     const diagnostic = objectValue(row.diagnostic_metadata);
-    const payload = diagnostic.payload;
-    const envelope = diagnostic.envelope;
+    const reconstructed = await this.reconstructMissingCarrier(row, requestedAt);
+    const payload = diagnostic.payload ?? reconstructed.payload;
+    const envelope = diagnostic.envelope ?? reconstructed.envelope;
 
     if (!isRecord(payload)) {
       return failedCandidate(baseCandidate, "missing-stored-payload");
@@ -1050,6 +1056,130 @@ export class PostgresApprovalOutboxReconciler implements ApprovalReconciler {
         payload
       }
     };
+  }
+
+  private async reconstructMissingCarrier(
+    row: ApprovalOutboxRow,
+    requestedAt: string
+  ): Promise<{ readonly payload?: Readonly<Record<string, unknown>>; readonly envelope?: WorkerMessageEnvelope }> {
+    const diagnostic = objectValue(row.diagnostic_metadata);
+
+    if (isRecord(diagnostic.payload) && isRecord(diagnostic.envelope)) {
+      return {};
+    }
+
+    const decisionId = approvalDecisionIdFromOutboxRow(row);
+
+    if (decisionId === undefined) {
+      return {};
+    }
+
+    const decision = await this.findReplayDecision(decisionId);
+
+    if (decision === undefined
+      || row.destination_stage !== "translation"
+      || row.entity_kind !== "article"
+      || row.entity_id !== decision.canonicalArticleId
+      || row.operation_version !== decision.articleVersion
+      || row.idempotency_key !== `approval:translation:${decision.decisionId}`) {
+      return {};
+    }
+
+    const expectedPayloadRef = approvalTranslationPayloadRef(decision);
+
+    if (row.payload_ref !== expectedPayloadRef) {
+      return {};
+    }
+
+    const stageExecutionId = stableUuid([
+      "translation-stage-execution",
+      decision.decisionId
+    ]);
+    const payload = {
+      schemaId: STAGE_PAYLOAD_SCHEMA_IDS.translationTask,
+      schemaVersion: STAGE_PAYLOAD_SCHEMA_VERSION,
+      pipelineRunId: row.pipeline_run_id,
+      stageExecutionId,
+      sourceMessageId: decision.sourceMessageId,
+      idempotencyKey: row.idempotency_key,
+      traceparent: decision.traceparent,
+      producedAt: decision.decidedAt,
+      articleId: decision.canonicalArticleId,
+      sourceLanguage: decision.sourceLanguage,
+      targetLanguages: this.options.config.targetLanguages,
+      reason: "new_article",
+      existingLanguageCodes: []
+    };
+
+    if (row.stage_execution_id !== stageExecutionId || row.payload_digest !== sha256Json(payload)) {
+      return {};
+    }
+
+    const payloadValidation = validateStagePayload(payload);
+
+    if (!payloadValidation.ok) {
+      return {};
+    }
+
+    const route = getWorkerRoute("translation");
+    const envelope = assertReplayEnvelope({
+      schemaId: route.schemaId,
+      schemaVersion: row.schema_version,
+      route: "translation",
+      messageId: row.outbox_message_id,
+      causationId: decision.sourceMessageId,
+      correlationId: decision.correlationId,
+      traceparent: decision.traceparent,
+      idempotencyKey: row.idempotency_key,
+      aggregate: {
+        type: "article",
+        id: decision.canonicalArticleId,
+        version: decision.articleVersion
+      },
+      occurredAt: decision.decidedAt,
+      attempt: {
+        count: 1,
+        max: WORKER_DELIVERY_BEHAVIOR.maxAttempts,
+        firstAttemptAt: decision.decidedAt,
+        lastAttemptAt: requestedAt
+      },
+      producer: {
+        name: this.options.config.serviceName,
+        version: this.options.config.serviceVersion
+      },
+      payloadRef: {
+        kind: "backend-record",
+        uri: expectedPayloadRef,
+        mediaType: "application/json",
+        sizeBytes: getStagePayloadSizeBytes(payload)
+      }
+    });
+
+    if (envelope === undefined) {
+      return {};
+    }
+
+    return {
+      payload,
+      envelope
+    };
+  }
+
+  private async findReplayDecision(decisionId: string): Promise<ApprovalStoredDecision | undefined> {
+    const result = await this.options.pool.query<ApprovalDecisionRow>(
+      `SELECT article_identity_hash, approval_version, decision, positivity_score, ai_provider,
+              ai_model, prompt_version, model_version, model_metadata, diagnostic_metadata, reviewed_at
+       FROM ${APPROVAL_SCHEMA}.approval_decisions
+       WHERE diagnostic_metadata->>'decisionId' = $1
+       LIMIT 1`,
+      [
+        decisionId
+      ]
+    );
+
+    const snapshot = objectValue(result.rows[0]?.diagnostic_metadata).decisionSnapshot;
+
+    return isReplayableApprovalDecisionSnapshot(snapshot) ? snapshot : undefined;
   }
 
   private async recordReplay(
@@ -1735,6 +1865,37 @@ function candidateFromRow(row: ApprovalOutboxRow, selectedReason: string): Appro
   };
 }
 
+function approvalDecisionIdFromOutboxRow(row: ApprovalOutboxRow): string | undefined {
+  const keyPrefix = "approval:translation:";
+
+  if (row.idempotency_key.startsWith(keyPrefix) && row.idempotency_key.length > keyPrefix.length) {
+    return row.idempotency_key.slice(keyPrefix.length);
+  }
+
+  const pathParts = row.payload_ref.split("/");
+  const decisionId = pathParts.length >= 2 ? pathParts[pathParts.length - 2] : undefined;
+
+  if (decisionId === undefined || decisionId.length === 0 || decisionId === "approval") {
+    return undefined;
+  }
+
+  try {
+    return decodeURIComponent(decisionId);
+  } catch {
+    return undefined;
+  }
+}
+
+function approvalTranslationPayloadRef(decision: ApprovalStoredDecision): string {
+  return `backend://worker-uplift/approval/${encodeURIComponent(decision.canonicalArticleId)}/${decision.decisionId}/translation-task`;
+}
+
+function assertReplayEnvelope(value: unknown): WorkerMessageEnvelope | undefined {
+  const validation = validateWorkerEnvelope(value);
+
+  return validation.ok ? validation.value : undefined;
+}
+
 function failedCandidate(candidate: ApprovalReconciliationCandidate, failedClosedReason: string): ApprovalReconciliationCandidate {
   return {
     ...candidate,
@@ -1888,6 +2049,24 @@ function isApprovalDecisionSnapshot(value: unknown): value is ApprovalStoredDeci
     && typeof value.model === "string"
     && typeof value.promptId === "string"
     && typeof value.promptVersion === "string";
+}
+
+function isReplayableApprovalDecisionSnapshot(value: unknown): value is ApprovalStoredDecision {
+  return isApprovalDecisionSnapshot(value)
+    && value.decisionId.trim().length > 0
+    && value.canonicalArticleId.trim().length > 0
+    && Number.isInteger(value.articleVersion)
+    && value.articleVersion > 0
+    && typeof value.sourceMessageId === "string"
+    && value.sourceMessageId.trim().length > 0
+    && typeof value.correlationId === "string"
+    && value.correlationId.trim().length > 0
+    && typeof value.traceparent === "string"
+    && value.traceparent.trim().length > 0
+    && typeof value.decidedAt === "string"
+    && value.decidedAt.trim().length > 0
+    && typeof value.sourceLanguage === "string"
+    && value.sourceLanguage.trim().length > 0;
 }
 
 function isTranslationPublication(value: unknown): value is ApprovalTranslationPublication {
