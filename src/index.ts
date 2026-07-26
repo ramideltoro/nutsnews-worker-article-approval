@@ -18,6 +18,7 @@ import type { ApprovalDependencies } from "./dependencies.js";
 import { createArticleApprovalWorkHandler } from "./approval.js";
 import { createApprovalHttpServer } from "./http.js";
 import { createProductionApprovalDependencies } from "./production.js";
+import type { ApprovalReconciler } from "./reconciliation.js";
 import { createApprovalService } from "./service.js";
 import { createLocalApprovalDependencies } from "./test-doubles.js";
 
@@ -67,9 +68,18 @@ export {
   type ApprovalHttpServer
 } from "./http.js";
 export {
+  APPROVAL_RECONCILIATION_CONFIRMATION,
+  APPROVAL_RECONCILIATION_PATH,
+  type ApprovalReconciliationCandidate,
+  type ApprovalReconciliationReport,
+  type ApprovalReconciliationRequest,
+  type ApprovalReconciler
+} from "./reconciliation.js";
+export {
   LocalAiApprovalQwenClient,
   PayloadRabbitMqTransport,
   PostgresApprovalBrokerOutbox,
+  PostgresApprovalOutboxReconciler,
   PostgresApprovalStateStore,
   PostgresApprovalTransactionRunner,
   StaticApprovalPromptRegistry,
@@ -156,6 +166,12 @@ export function createApprovalApplication(config = loadApprovalConfig()): Approv
   const httpServer = createApprovalHttpServer({
     config,
     service,
+    ...(hasReconciler(baseDependencies) ? {
+      reconciler: baseDependencies.reconciler
+    } : {}),
+    ...(hasReconciliationToken(baseDependencies) ? {
+      reconciliationToken: baseDependencies.reconciliationToken
+    } : {}),
     ...(metrics === undefined ? {} : {
       metrics
     })
@@ -204,6 +220,22 @@ function hasDependencyCloser(
   const candidate = dependencies as Partial<{ readonly close: unknown }>;
 
   return typeof candidate.close === "function";
+}
+
+function hasReconciler(
+  dependencies: ApprovalDependencies
+): dependencies is ApprovalDependencies & { readonly reconciler: ApprovalReconciler } {
+  const candidate = dependencies as Partial<{ readonly reconciler: unknown }>;
+
+  return typeof candidate.reconciler === "object" && candidate.reconciler !== null;
+}
+
+function hasReconciliationToken(
+  dependencies: ApprovalDependencies
+): dependencies is ApprovalDependencies & { readonly reconciliationToken: string } {
+  const candidate = dependencies as Partial<{ readonly reconciliationToken: unknown }>;
+
+  return typeof candidate.reconciliationToken === "string" && candidate.reconciliationToken.length > 0;
 }
 
 function combineTelemetrySinks(
