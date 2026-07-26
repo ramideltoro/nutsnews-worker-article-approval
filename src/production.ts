@@ -180,6 +180,8 @@ export class PayloadRabbitMqTransport implements RuntimeBrokerTransport {
   private readonly inFlight = new Set<Promise<void>>();
   private connection: ChannelModel | undefined;
   private channel: ConfirmChannel | undefined;
+  private reconnectTimer: ReturnType<typeof setTimeout> | undefined;
+  private reconnecting = false;
   private routes: readonly WorkerRoute[] = [];
   private closing = false;
 
@@ -278,6 +280,7 @@ export class PayloadRabbitMqTransport implements RuntimeBrokerTransport {
 
   async close(): Promise<void> {
     this.closing = true;
+    this.clearReconnectTimer();
     const channel = this.channel;
 
     if (channel !== undefined) {
@@ -322,9 +325,23 @@ export class PayloadRabbitMqTransport implements RuntimeBrokerTransport {
       }
 
       this.markChannelClosed(channel);
+      this.scheduleConsumerReconnect();
+    });
+    connection.on("error", () => {
+      if (this.connection === connection) {
+        this.connection = undefined;
+      }
+
+      this.markChannelClosed(channel);
+      this.scheduleConsumerReconnect();
     });
     channel.on("close", () => {
       this.markChannelClosed(channel);
+      this.scheduleConsumerReconnect();
+    });
+    channel.on("error", () => {
+      this.markChannelClosed(channel);
+      this.scheduleConsumerReconnect();
     });
 
     await this.restoreConsumers(channel);
@@ -374,6 +391,46 @@ export class PayloadRabbitMqTransport implements RuntimeBrokerTransport {
 
     for (const registration of this.consumers.values()) {
       registration.consumerTag = undefined;
+    }
+  }
+
+  private scheduleConsumerReconnect(): void {
+    if (this.closing || this.consumers.size === 0 || this.reconnecting || this.reconnectTimer !== undefined) {
+      return;
+    }
+
+    this.reconnectTimer = setTimeout(() => {
+      void this.reconnectConsumers();
+    }, 1_000);
+    this.reconnectTimer.unref();
+  }
+
+  private clearReconnectTimer(): void {
+    if (this.reconnectTimer !== undefined) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = undefined;
+    }
+  }
+
+  private async reconnectConsumers(): Promise<void> {
+    this.reconnectTimer = undefined;
+
+    if (this.closing || this.consumers.size === 0 || this.channel !== undefined) {
+      return;
+    }
+
+    this.reconnecting = true;
+    let retry = false;
+    try {
+      await this.ensureChannel();
+    } catch {
+      retry = true;
+    } finally {
+      this.reconnecting = false;
+    }
+
+    if (retry) {
+      this.scheduleConsumerReconnect();
     }
   }
 
