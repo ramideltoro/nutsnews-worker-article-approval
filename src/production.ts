@@ -1,8 +1,11 @@
 import { createHash, randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
 
 import {
   WORKER_DELIVERY_BEHAVIOR,
   getWorkerRoute,
+  validateStagePayload,
+  validateWorkerEnvelope,
   type WorkerMessageEnvelope,
   type WorkerRoute,
   type WorkerStage
@@ -60,6 +63,13 @@ import {
   type ApprovalWorkHandler
 } from "./dependencies.js";
 import { stableUuid } from "./ids.js";
+import {
+  APPROVAL_RECONCILIATION_CONFIRMATION,
+  type ApprovalReconciliationCandidate,
+  type ApprovalReconciliationReport,
+  type ApprovalReconciliationRequest,
+  type ApprovalReconciler
+} from "./reconciliation.js";
 import { LocalApprovalWorkHandler } from "./test-doubles.js";
 
 const APPROVAL_SCHEMA = "worker_uplift_approval";
@@ -68,6 +78,8 @@ const DEFAULT_CONFIRM_TIMEOUT_MS = WORKER_DELIVERY_BEHAVIOR.confirmTimeoutMs;
 const DEFAULT_DRAIN_TIMEOUT_MS = 30_000;
 
 export type ProductionApprovalDependencies = ApprovalDependencies & {
+  readonly reconciler: ApprovalReconciler;
+  readonly reconciliationToken?: string;
   close(): Promise<void>;
 };
 
@@ -119,6 +131,13 @@ export function createProductionApprovalDependencies(
   const stateStore = new PostgresApprovalStateStore(pool);
   const transactionRunner = new PostgresApprovalTransactionRunner(pool);
   const brokerOutbox = new PostgresApprovalBrokerOutbox(pool);
+  const reconciler = new PostgresApprovalOutboxReconciler({
+    pool,
+    brokerTransport,
+    clock: options.clock,
+    env
+  });
+  const reconciliationToken = reconciliationTokenFromEnv(env);
   const qwenClient = new LocalAiApprovalQwenClient({
     baseUrl: requiredEnv(env, "NUTSNEWS_APPROVAL_QWEN_BASE_URL"),
     apiKey: requiredEnv(env, "NUTSNEWS_APPROVAL_QWEN_API_KEY"),
@@ -131,6 +150,10 @@ export function createProductionApprovalDependencies(
     stateStore,
     transactionRunner,
     brokerOutbox,
+    reconciler,
+    ...(reconciliationToken === undefined ? {} : {
+      reconciliationToken
+    }),
     brokerTransport,
     qwenClient,
     promptRegistry,
@@ -777,12 +800,330 @@ export class PostgresApprovalBrokerOutbox implements ApprovalBrokerOutbox {
         receipt.confirmedAt,
         receipt.confirmedAt,
         JSON.stringify({
+          envelope: command.envelope,
           exchange: receipt.exchange,
           payload,
           payloadSchemaId: payload.schemaId
         })
       ]
     );
+  }
+}
+
+interface ApprovalOutboxReconcilerOptions {
+  readonly pool: Pool;
+  readonly brokerTransport: RuntimeBrokerTransport;
+  readonly clock: RuntimeClock;
+  readonly env: NodeJS.ProcessEnv;
+}
+
+interface ApprovalOutboxRow extends QueryResultRow {
+  readonly id: string | number;
+  readonly outbox_message_id: string;
+  readonly pipeline_run_id: string;
+  readonly stage_execution_id: string;
+  readonly destination_stage: string;
+  readonly routing_key: string;
+  readonly entity_kind: string;
+  readonly entity_id: string;
+  readonly schema_version: number;
+  readonly operation_version: number;
+  readonly idempotency_key: string;
+  readonly payload_ref: string;
+  readonly payload_digest: string;
+  readonly created_at: Date;
+  readonly published_at: Date | null;
+  readonly confirmed_at: Date | null;
+  readonly status: string;
+  readonly diagnostic_metadata: unknown;
+}
+
+interface HydratedReplay {
+  readonly row: ApprovalOutboxRow;
+  readonly candidate: ApprovalReconciliationCandidate;
+  readonly command: BrokerPublishCommand;
+}
+
+export class PostgresApprovalOutboxReconciler implements ApprovalReconciler {
+  readonly name = "postgres-approval-outbox-reconciler";
+
+  constructor(private readonly options: ApprovalOutboxReconcilerOptions) {}
+
+  async reconcile(request: ApprovalReconciliationRequest): Promise<ApprovalReconciliationReport> {
+    const requestedAt = runtimeNow(this.options.clock);
+    const mode = request.mode === "apply" ? "apply" : "dry-run";
+    const maxItems = boundedInteger(request.maxItems, 100, 1, 100);
+    const minAgeSeconds = boundedInteger(request.minAgeSeconds, 900, 0, 86_400);
+    const reason = safeReason(request.reason);
+    const runId = safeRunId(request.runId);
+
+    if (this.killSwitchActive()) {
+      return report({
+        mode,
+        requestedAt,
+        runId,
+        reason,
+        maxItems,
+        minAgeSeconds,
+        status: "kill_switch_active",
+        errors: [
+          "approval reconciliation stop switch is active"
+        ],
+        candidates: []
+      });
+    }
+
+    if (mode === "apply") {
+      const applyError = this.applyGateError(request, runId);
+
+      if (applyError !== undefined) {
+        return report({
+          mode,
+          requestedAt,
+          runId,
+          reason,
+          maxItems,
+          minAgeSeconds,
+          status: "failed_closed",
+          errors: [
+            applyError
+          ],
+          candidates: []
+        });
+      }
+    }
+
+    const rows = await this.selectCandidates(maxItems, minAgeSeconds, runId);
+    const hydrated = rows.map((row) => this.hydrate(row, requestedAt));
+    const failed = hydrated.filter((candidate): candidate is ApprovalReconciliationCandidate => "status" in candidate);
+
+    if (failed.length > 0) {
+      return report({
+        mode,
+        requestedAt,
+        runId,
+        reason,
+        maxItems,
+        minAgeSeconds,
+        status: "failed_closed",
+        errors: failed.map((candidate) => `${candidate.outboxId}:${candidate.failedClosedReason ?? "unrecoverable-payload"}`),
+        candidates: failed
+      });
+    }
+
+    const replayable = hydrated as HydratedReplay[];
+
+    if (mode === "dry-run") {
+      return report({
+        mode,
+        requestedAt,
+        runId,
+        reason,
+        maxItems,
+        minAgeSeconds,
+        status: "dry_run",
+        candidates: replayable.map((item) => item.candidate),
+        errors: []
+      });
+    }
+
+    const replayed: ApprovalReconciliationCandidate[] = [];
+
+    for (const item of replayable) {
+      if (this.killSwitchActive()) {
+        return report({
+          mode,
+          requestedAt,
+          runId,
+          reason,
+          maxItems,
+          minAgeSeconds,
+          status: "kill_switch_active",
+          candidates: replayed,
+          errors: [
+            "approval reconciliation stop switch became active"
+          ]
+        });
+      }
+
+      const receipt = await this.options.brokerTransport.publish(item.command);
+      await this.recordReplay(item.row, item.command, receipt, requestedAt, runId ?? "untracked", reason);
+      replayed.push({
+        ...item.candidate,
+        status: "replayed",
+        replayMessageId: receipt.messageId
+      });
+    }
+
+    return report({
+      mode,
+      requestedAt,
+      runId,
+      reason,
+      maxItems,
+      minAgeSeconds,
+      status: "applied",
+      candidates: replayed,
+      errors: []
+    });
+  }
+
+  private async selectCandidates(maxItems: number, minAgeSeconds: number, runId: string | undefined): Promise<readonly ApprovalOutboxRow[]> {
+    const result = await this.options.pool.query<ApprovalOutboxRow>(
+      `SELECT id, outbox_message_id, pipeline_run_id, stage_execution_id, destination_stage, routing_key,
+              entity_kind, entity_id, schema_version, operation_version, idempotency_key,
+              payload_ref, payload_digest, created_at, published_at, confirmed_at, status, diagnostic_metadata
+       FROM ${APPROVAL_SCHEMA}.outbox
+       WHERE status = 'confirmed'
+         AND confirmed_at IS NOT NULL
+         AND created_at <= now() - ($2::integer * interval '1 second')
+         AND ($3::text IS NULL OR diagnostic_metadata->>'lastReconciliationRunId' IS DISTINCT FROM $3::text)
+       ORDER BY created_at ASC, id ASC
+       LIMIT $1`,
+      [
+        maxItems,
+        minAgeSeconds,
+        runId ?? null
+      ]
+    );
+
+    return result.rows;
+  }
+
+  private hydrate(row: ApprovalOutboxRow, requestedAt: string): HydratedReplay | ApprovalReconciliationCandidate {
+    const baseCandidate = candidateFromRow(row, "confirmed-outbox-replay");
+    const diagnostic = objectValue(row.diagnostic_metadata);
+    const payload = diagnostic.payload;
+    const envelope = diagnostic.envelope;
+
+    if (!isRecord(payload)) {
+      return failedCandidate(baseCandidate, "missing-stored-payload");
+    }
+
+    if (!isRecord(envelope)) {
+      return failedCandidate(baseCandidate, "missing-stored-envelope");
+    }
+
+    if (row.payload_ref !== stringFrom(objectValue(envelope.payloadRef).uri, "")) {
+      return failedCandidate(baseCandidate, "payload-ref-mismatch");
+    }
+
+    if (row.payload_digest !== sha256Json(payload)) {
+      return failedCandidate(baseCandidate, "payload-digest-mismatch");
+    }
+
+    const payloadValidation = validateStagePayload(payload);
+
+    if (!payloadValidation.ok) {
+      return failedCandidate(baseCandidate, `invalid-stored-payload:${payloadValidation.issues[0]?.code ?? "unknown"}`);
+    }
+
+    const replayMessageId = randomUUID();
+    const attempt = objectValue(envelope.attempt);
+    const replayEnvelope = {
+      ...envelope,
+      messageId: replayMessageId,
+      occurredAt: requestedAt,
+      attempt: {
+        ...attempt,
+        lastAttemptAt: requestedAt
+      }
+    };
+    const envelopeValidation = validateWorkerEnvelope(replayEnvelope);
+
+    if (!envelopeValidation.ok) {
+      return failedCandidate(baseCandidate, `invalid-stored-envelope:${envelopeValidation.issues[0]?.code ?? "unknown"}`);
+    }
+
+    if (envelopeValidation.value.route !== row.destination_stage) {
+      return failedCandidate(baseCandidate, "destination-stage-mismatch");
+    }
+
+    return {
+      row,
+      candidate: {
+        ...baseCandidate,
+        replayMessageId
+      },
+      command: {
+        envelope: envelopeValidation.value,
+        payload
+      }
+    };
+  }
+
+  private async recordReplay(
+    row: ApprovalOutboxRow,
+    command: BrokerPublishCommand,
+    receipt: BrokerPublishReceipt,
+    requestedAt: string,
+    runId: string,
+    reason: string | undefined
+  ): Promise<void> {
+    const audit = {
+      event: "approval.outbox.replayed",
+      runId,
+      reason: reason ?? "unspecified",
+      originalMessageId: row.outbox_message_id,
+      replayMessageId: command.envelope.messageId,
+      idempotencyKey: command.envelope.idempotencyKey,
+      correlationId: command.envelope.correlationId,
+      causationId: command.envelope.causationId,
+      articleId: command.envelope.aggregate.id,
+      articleVersion: command.envelope.aggregate.version,
+      replayedAt: requestedAt,
+      exchange: receipt.exchange,
+      routingKey: receipt.routingKey
+    };
+
+    await this.options.pool.query(
+      `UPDATE ${APPROVAL_SCHEMA}.outbox
+       SET diagnostic_metadata =
+         jsonb_set(
+           diagnostic_metadata || $2::jsonb,
+           '{reconciliationAuditHistory}',
+           coalesce(diagnostic_metadata->'reconciliationAuditHistory', '[]'::jsonb) || $3::jsonb,
+           true
+         )
+       WHERE id = $1`,
+      [
+        row.id,
+        JSON.stringify({
+          lastReconciliationRunId: runId,
+          reconciliationLastReplayAt: requestedAt,
+          reconciliationLastReplayMessageId: command.envelope.messageId
+        }),
+        JSON.stringify([
+          audit
+        ])
+      ]
+    );
+  }
+
+  private applyGateError(request: ApprovalReconciliationRequest, runId: string | undefined): string | undefined {
+    if (!this.applyEnabled()) {
+      return "approval reconciliation apply is disabled by configuration";
+    }
+
+    if (request.protectedConfirmation !== APPROVAL_RECONCILIATION_CONFIRMATION) {
+      return `protectedConfirmation must be ${APPROVAL_RECONCILIATION_CONFIRMATION}`;
+    }
+
+    if (runId === undefined) {
+      return "runId is required for apply";
+    }
+
+    return undefined;
+  }
+
+  private applyEnabled(): boolean {
+    return flagEnabled(this.options.env.NUTSNEWS_WORKER_UPLIFT_RECONCILIATION_APPLY_ENABLED)
+      || flagEnabled(this.options.env.NUTSNEWS_APPROVAL_RECONCILIATION_APPLY_ENABLED);
+  }
+
+  private killSwitchActive(): boolean {
+    return flagEnabled(this.options.env.NUTSNEWS_WORKER_UPLIFT_RECONCILIATION_STOP)
+      || flagEnabled(this.options.env.NUTSNEWS_APPROVAL_RECONCILIATION_STOP);
   }
 }
 
@@ -1298,6 +1639,140 @@ function requiredEnv(env: NodeJS.ProcessEnv, key: string): string {
   }
 
   return value;
+}
+
+function reconciliationTokenFromEnv(env: NodeJS.ProcessEnv): string | undefined {
+  const directToken = optionalEnv(env, "NUTSNEWS_APPROVAL_RECONCILIATION_TOKEN")
+    ?? optionalEnv(env, "NUTSNEWS_WORKER_UPLIFT_RECONCILIATION_TOKEN");
+
+  if (directToken !== undefined) {
+    return directToken;
+  }
+
+  const tokenFile = optionalEnv(env, "NUTSNEWS_APPROVAL_RECONCILIATION_TOKEN_FILE")
+    ?? optionalEnv(env, "NUTSNEWS_WORKER_UPLIFT_RECONCILIATION_TOKEN_FILE");
+
+  if (tokenFile === undefined) {
+    return undefined;
+  }
+
+  const value = readFileSync(tokenFile, "utf8").trim();
+
+  return value.length > 0 ? value : undefined;
+}
+
+function optionalEnv(env: NodeJS.ProcessEnv, key: string): string | undefined {
+  const value = env[key]?.trim();
+
+  return value === undefined || value.length === 0 ? undefined : value;
+}
+
+function report(input: {
+  readonly mode: ApprovalReconciliationRequest["mode"];
+  readonly requestedAt: string;
+  readonly runId?: string | undefined;
+  readonly reason?: string | undefined;
+  readonly maxItems: number;
+  readonly minAgeSeconds: number;
+  readonly status: ApprovalReconciliationReport["status"];
+  readonly candidates: readonly ApprovalReconciliationCandidate[];
+  readonly errors: readonly string[];
+}): ApprovalReconciliationReport {
+  const replayedCount = input.candidates.filter((candidate) => candidate.status === "replayed").length;
+  const failedClosedCount = input.candidates.filter((candidate) => candidate.status === "failed_closed").length;
+  const skippedCount = input.status === "failed_closed"
+    ? Math.max(0, input.candidates.length - failedClosedCount)
+    : 0;
+  const base = {
+    service: "approval",
+    mode: input.mode,
+    status: input.status,
+    requestedAt: input.requestedAt,
+    maxItems: input.maxItems,
+    minAgeSeconds: input.minAgeSeconds,
+    selectedCount: input.candidates.length,
+    replayedCount,
+    failedClosedCount,
+    skippedCount,
+    writesPerformed: replayedCount > 0,
+    dryRun: input.mode === "dry-run",
+    productionVisibilityEnabled: false,
+    legacyRuntimeRequired: false,
+    protectedApplyRequired: true,
+    candidates: input.candidates,
+    errors: input.errors,
+    metrics: {
+      candidateCount: input.candidates.length,
+      replayedCount,
+      failedClosedCount,
+      skippedCount
+    }
+  } satisfies Omit<ApprovalReconciliationReport, "runId" | "reason">;
+
+  return {
+    ...base,
+    ...(input.runId === undefined ? {} : {
+      runId: input.runId
+    }),
+    ...(input.reason === undefined ? {} : {
+      reason: input.reason
+    })
+  };
+}
+
+function candidateFromRow(row: ApprovalOutboxRow, selectedReason: string): ApprovalReconciliationCandidate {
+  return {
+    outboxId: String(row.id),
+    idempotencyKey: row.idempotency_key,
+    destinationStage: row.destination_stage,
+    routingKey: row.routing_key,
+    entityKind: row.entity_kind,
+    entityId: row.entity_id,
+    payloadRef: row.payload_ref,
+    payloadDigest: row.payload_digest,
+    selectedReason,
+    status: "selected"
+  };
+}
+
+function failedCandidate(candidate: ApprovalReconciliationCandidate, failedClosedReason: string): ApprovalReconciliationCandidate {
+  return {
+    ...candidate,
+    status: "failed_closed",
+    failedClosedReason
+  };
+}
+
+function boundedInteger(value: unknown, defaultValue: number, min: number, max: number): number {
+  if (typeof value !== "number" || !Number.isInteger(value)) {
+    return defaultValue;
+  }
+
+  return Math.max(min, Math.min(max, value));
+}
+
+function safeRunId(value: unknown): string | undefined {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+
+  const trimmed = value.trim();
+
+  return /^[a-zA-Z0-9][a-zA-Z0-9._:/-]{0,127}$/u.test(trimmed) ? trimmed : undefined;
+}
+
+function safeReason(value: unknown): string | undefined {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+
+  const trimmed = value.replace(/[\r\n\t]+/gu, " ").trim();
+
+  return trimmed.length === 0 ? undefined : trimmed.slice(0, 160);
+}
+
+function flagEnabled(value: string | undefined): boolean {
+  return value?.trim().toLowerCase() === "true";
 }
 
 function safeHeaderValue(value: string): string | undefined {

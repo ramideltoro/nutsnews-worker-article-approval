@@ -11,6 +11,10 @@ import {
   createApprovalHttpServer,
   type ApprovalHttpServer
 } from "../src/http.js";
+import type {
+  ApprovalReconciliationReport,
+  ApprovalReconciler
+} from "../src/reconciliation.js";
 import { createApprovalService } from "../src/service.js";
 import { createLocalApprovalDependencies } from "../src/test-doubles.js";
 
@@ -68,6 +72,81 @@ describe("approval HTTP endpoints", () => {
     expect(JSON.stringify(schema)).not.toContain("amqp://");
     expect(JSON.stringify(schema)).not.toContain("postgres://");
     expect(JSON.stringify(schema)).not.toContain("sk-");
+
+    await service.stop();
+  });
+
+  it("protects the reconciliation endpoint with bearer auth", async () => {
+    const config = loadApprovalConfig({
+      NUTSNEWS_APPROVAL_HTTP_HOST: "127.0.0.1",
+      NUTSNEWS_APPROVAL_HTTP_PORT: "0",
+      NUTSNEWS_APPROVAL_TELEMETRY_LOGS: "silent"
+    });
+    const service = createApprovalService({
+      config,
+      dependencies: createLocalApprovalDependencies()
+    });
+    const reconciler: ApprovalReconciler = {
+      name: "test-reconciler",
+      reconcile: (request) => Promise.resolve({
+        service: "approval",
+        mode: request.mode,
+        status: "dry_run",
+        requestedAt: "2026-07-23T00:00:00.000Z",
+        maxItems: 1,
+        minAgeSeconds: 900,
+        selectedCount: 0,
+        replayedCount: 0,
+        failedClosedCount: 0,
+        skippedCount: 0,
+        writesPerformed: false,
+        dryRun: true,
+        productionVisibilityEnabled: false,
+        legacyRuntimeRequired: false,
+        protectedApplyRequired: true,
+        candidates: [],
+        errors: [],
+        metrics: {
+          candidateCount: 0,
+          replayedCount: 0,
+          failedClosedCount: 0,
+          skippedCount: 0
+        }
+      } satisfies ApprovalReconciliationReport)
+    };
+    activeServer = createApprovalHttpServer({
+      config,
+      service,
+      reconciler,
+      reconciliationToken: "test-token"
+    });
+
+    await service.start();
+    await activeServer.listen();
+
+    const unauthorized = await fetch(activeServer.url("/reconcile/outbox"), {
+      method: "POST",
+      body: JSON.stringify({
+        mode: "dry-run"
+      })
+    });
+    expect(unauthorized.status).toBe(401);
+
+    const authorized = await fetch(activeServer.url("/reconcile/outbox"), {
+      method: "POST",
+      headers: {
+        authorization: "Bearer test-token"
+      },
+      body: JSON.stringify({
+        mode: "dry-run"
+      })
+    });
+    expect(authorized.status).toBe(200);
+    await expect(authorized.json()).resolves.toMatchObject({
+      status: "dry_run",
+      writesPerformed: false,
+      productionVisibilityEnabled: false
+    });
 
     await service.stop();
   });
