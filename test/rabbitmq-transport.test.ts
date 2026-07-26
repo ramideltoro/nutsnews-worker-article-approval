@@ -4,9 +4,11 @@ import type {
   ConsumeMessage
 } from "amqplib";
 import {
+  afterEach,
   describe,
   expect,
-  it
+  it,
+  vi
 } from "vitest";
 
 import { PayloadRabbitMqTransport } from "../src/production.js";
@@ -37,6 +39,10 @@ const clock = {
 };
 
 describe("RabbitMQ payload transport", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
   it("restores registered approval consumers after reconnecting", async () => {
     const broker = createFakeBroker();
     const transport = new PayloadRabbitMqTransport({
@@ -69,6 +75,36 @@ describe("RabbitMQ payload transport", () => {
     expect(broker.connections[1]?.channel.prefetchCalls).toEqual([
       2
     ]);
+  });
+
+  it("automatically restores registered approval consumers after broker close", async () => {
+    vi.useFakeTimers();
+    const broker = createFakeBroker();
+    const transport = new PayloadRabbitMqTransport({
+      url: "amqp://approval:test@example.invalid:5672",
+      prefetch: 2,
+      clock,
+      connect: broker.connect
+    });
+
+    await transport.consume("approval", () => Promise.resolve({
+      action: "dlq",
+      reason: "not-used"
+    }));
+
+    expect(broker.connections).toHaveLength(1);
+    broker.connections[0]?.emitClose();
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    expect(broker.connections).toHaveLength(2);
+    expect(broker.connections[1]?.channel.consumeQueues).toEqual([
+      "nutsnews.worker.approval.v1"
+    ]);
+    expect(broker.connections[1]?.channel.prefetchCalls).toEqual([
+      2
+    ]);
+
+    await transport.close();
   });
 });
 
