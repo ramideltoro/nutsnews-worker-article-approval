@@ -136,6 +136,23 @@ describe("createApprovalService", () => {
 
     await context.service.stop();
   });
+  it("reports readiness unhealthy when the main queue consumer is cancelled", async () => {
+    const context = createServiceContext();
+
+    await context.service.start();
+    await context.service.consumer?.cancel();
+
+    const readiness = await context.service.health.readiness();
+    expect(readiness.status).toBe("unhealthy");
+    const consumerCheck = readiness.checks.find((check) => check.name === "rabbitmq-consumer");
+    expect(consumerCheck?.status).toBe("unhealthy");
+    expect(consumerCheck?.details).toMatchObject({
+      queue: "nutsnews.worker.approval.v1",
+      activeConsumers: 0
+    });
+
+    await context.service.stop();
+  });
 });
 
 function createServiceContext() {

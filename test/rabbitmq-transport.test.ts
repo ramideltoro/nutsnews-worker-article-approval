@@ -10,6 +10,7 @@ import {
   it,
   vi
 } from "vitest";
+import { createBufferedRuntimeTelemetrySink } from "@ramideltoro/nutsnews-worker-runtime";
 
 import { PayloadRabbitMqTransport } from "../src/production.js";
 
@@ -80,11 +81,13 @@ describe("RabbitMQ payload transport", () => {
   it("automatically restores registered approval consumers after broker close", async () => {
     vi.useFakeTimers();
     const broker = createFakeBroker();
+    const telemetry = createBufferedRuntimeTelemetrySink();
     const transport = new PayloadRabbitMqTransport({
       url: "amqp://approval:test@example.invalid:5672",
       prefetch: 2,
       clock,
-      connect: broker.connect
+      connect: broker.connect,
+      telemetry
     });
 
     await transport.consume("approval", () => Promise.resolve({
@@ -94,6 +97,15 @@ describe("RabbitMQ payload transport", () => {
 
     expect(broker.connections).toHaveLength(1);
     broker.connections[0]?.emitClose();
+    expect(transport.consumerStatus("approval")).toMatchObject({
+      state: "channel-dropped",
+      activeConsumers: 0
+    });
+    expect(telemetry.events).toContainEqual(expect.objectContaining({
+      name: "runtime.broker.consumer_state_changed",
+      outcome: "channel-dropped",
+      stage: "approval"
+    }));
     await vi.advanceTimersByTimeAsync(1_000);
 
     expect(broker.connections).toHaveLength(2);
@@ -103,6 +115,10 @@ describe("RabbitMQ payload transport", () => {
     expect(broker.connections[1]?.channel.prefetchCalls).toEqual([
       2
     ]);
+    expect(transport.consumerStatus("approval")).toMatchObject({
+      state: "active",
+      activeConsumers: 1
+    });
 
     await transport.close();
   });

@@ -8,6 +8,7 @@ import {
 } from "@ramideltoro/nutsnews-worker-contracts";
 import {
   createBrokerLifecycle,
+  createBrokerConsumerReadinessCheck,
   createRuntimeHealthProbeSet,
   createRuntimeInFlightDrainController,
   emitRuntimeTelemetry,
@@ -119,6 +120,7 @@ export function createApprovalService(options: ApprovalServiceOptions): Approval
         ],
         readinessChecks: [
           brokerReadinessCheck(broker),
+          createBrokerConsumerReadinessCheck(broker, "approval"),
           dependencyReadinessCheck("approval-state", options.dependencies.stateStore),
           dependencyReadinessCheck("database-transactions", options.dependencies.transactionRunner),
           dependencyReadinessCheck("broker-outbox", options.dependencies.brokerOutbox),
