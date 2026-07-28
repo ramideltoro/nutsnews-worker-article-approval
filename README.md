@@ -20,7 +20,8 @@ This service uses a versioned editorial prompt with the configured Qwen-compatib
 - Publishes contracted `translationTask` messages only when the stored decision is accepted and has not already been published downstream.
 - Keeps legacy OpenAI fallback disabled unless an explicit protected flag, nonzero budget, provenance marker, and alert topic are all configured.
 - Uses shared runtime broker lifecycle, in-flight drain, idempotency store, retry/DLQ destinations, health reports, and Prometheus metrics.
-- Keeps liveness independent from Qwen readiness; `/live` only checks process health, while `/ready` gates broker, state, outbox, Qwen, prompt registry, and shadow mode.
+- Keeps liveness independent from Qwen readiness; `/live` only checks process health, while `/ready` gates an active `approval` main-queue consumer, broker, state, outbox, Qwen, prompt registry, and shadow mode.
+- Emits bounded structured events and Prometheus metrics when RabbitMQ cancels the consumer, drops its channel, or restores consumption.
 
 ## Configuration
 
