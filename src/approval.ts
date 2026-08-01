@@ -46,6 +46,7 @@ export interface ArticleApprovalWorkHandlerOptions {
 
 interface QwenDecisionBase {
   readonly reasonCode: string;
+  readonly category: string;
   readonly confidenceScore: number;
   readonly qualityScore: number;
   readonly positivityScore: number;
@@ -281,6 +282,7 @@ async function modelDecision(
   const decisionValues = {
     decision: qwenDecision.decision,
     provider: "local_ai",
+    category: qwenDecision.category,
     ...(qwenDecision.decision === "accepted" ? {
       sourceSummary: qwenDecision.summary
     } : {
@@ -340,6 +342,7 @@ function storedDecision(
     readonly confidenceScore: number;
     readonly qualityScore: number;
     readonly sourceSummary?: string;
+    readonly category?: string;
     readonly usage?: QwenDecision["usage"];
     readonly latencyMs: number;
     readonly decidedAt: string;
@@ -390,6 +393,17 @@ function storedDecision(
     canonicalArticleId: enrichmentRecord.canonicalArticleId,
     articleVersion: enrichmentRecord.articleVersion,
     canonicalUrl: enrichmentRecord.canonicalUrl,
+    title: enrichmentRecord.title,
+    ...(enrichmentRecord.description === undefined ? {} : {
+      description: enrichmentRecord.description
+    }),
+    ...(enrichmentRecord.imageUrl === undefined ? {} : {
+      imageUrl: enrichmentRecord.imageUrl
+    }),
+    ...(enrichmentRecord.publishedAt === undefined ? {} : {
+      publishedAt: enrichmentRecord.publishedAt
+    }),
+    category: values.category ?? "Uplifting",
     decision: values.decision,
     ...(values.rejectionReason === undefined ? {} : {
       rejectionReason: values.rejectionReason
@@ -532,6 +546,7 @@ function modelRequest(
       requiredFields: [
         "decision",
         "reasonCode",
+        "category",
         "confidenceScore",
         "qualityScore",
         "positivityScore",
@@ -580,6 +595,7 @@ function validateQwenDecision(raw: unknown, config: ApprovalConfig, fallbackLate
 
   const decision = raw.decision;
   const reasonCode = raw.reasonCode;
+  const category = normalizedCategory(raw.category);
   const confidenceScore = raw.confidenceScore;
   const qualityScore = raw.qualityScore;
   const positivityScore = raw.positivityScore;
@@ -588,7 +604,7 @@ function validateQwenDecision(raw: unknown, config: ApprovalConfig, fallbackLate
     ? Math.max(0, raw.latencyMs)
     : fallbackLatencyMs;
 
-  if ((decision !== "accepted" && decision !== "rejected") || typeof reasonCode !== "string" || !REASON_CODE_RE.test(reasonCode) || !score(confidenceScore) || !score(qualityScore) || !score(positivityScore)) {
+  if ((decision !== "accepted" && decision !== "rejected") || typeof reasonCode !== "string" || !REASON_CODE_RE.test(reasonCode) || category === undefined || !score(confidenceScore) || !score(qualityScore) || !score(positivityScore)) {
     return invalidDecision("invalid_ai_decision_schema", latencyMs);
   }
 
@@ -618,6 +634,7 @@ function validateQwenDecision(raw: unknown, config: ApprovalConfig, fallbackLate
       value: {
         decision,
         reasonCode,
+        category,
         confidenceScore,
         qualityScore,
         positivityScore,
@@ -637,6 +654,7 @@ function validateQwenDecision(raw: unknown, config: ApprovalConfig, fallbackLate
     value: {
       decision,
       reasonCode,
+      category,
       confidenceScore,
       qualityScore,
       positivityScore,
@@ -847,6 +865,18 @@ function measuredDecisionDuration(
 
 function score(value: unknown): value is number {
   return Number.isInteger(value) && typeof value === "number" && value >= 0 && value <= 100;
+}
+
+function normalizedCategory(value: unknown): string | undefined {
+  if (typeof value !== "string") {
+    return "Uplifting";
+  }
+
+  const normalized = value.replace(/\s+/gu, " ").trim();
+
+  return normalized.length > 0 && normalized.length <= 160 && !SUMMARY_UNSAFE_RE.test(normalized)
+    ? normalized
+    : undefined;
 }
 
 function nonNegativeInteger(value: unknown): value is number {

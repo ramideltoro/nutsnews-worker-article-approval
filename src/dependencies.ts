@@ -160,6 +160,11 @@ export interface ApprovalStoredDecision {
   readonly canonicalArticleId: string;
   readonly articleVersion: number;
   readonly canonicalUrl: string;
+  readonly title: string;
+  readonly description?: string;
+  readonly imageUrl?: string;
+  readonly publishedAt?: string;
+  readonly category: string;
   readonly decision: "accepted" | "rejected" | "permanent_failure";
   readonly rejectionReason?: string;
   readonly provider: "prefilter" | "local_ai" | "legacy_openai_fallback";

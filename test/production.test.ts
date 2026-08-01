@@ -68,6 +68,7 @@ describe("production approval dependencies", () => {
     await expect(client.review(reviewRequest())).resolves.toMatchObject({
       decision: "accepted",
       reasonCode: "community-focused",
+      category: "community-focused",
       confidenceScore: 92,
       qualityScore: 90,
       positivityScore: 90,

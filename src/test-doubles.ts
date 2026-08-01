@@ -320,6 +320,7 @@ export class LocalApprovalQwenClient implements ApprovalQwenClient {
   response: unknown = {
     decision: "accepted",
     reasonCode: "newsworthy",
+    category: "Community | Uplifting",
     confidenceScore: 92,
     qualityScore: 88,
     positivityScore: 73,
