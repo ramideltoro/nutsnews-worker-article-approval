@@ -35,6 +35,7 @@ import {
   type ApprovalWorkTools
 } from "./dependencies.js";
 import { stableUuid } from "./ids.js";
+import { bestEffortTelemetrySink } from "./telemetry.js";
 
 export interface ArticleApprovalWorkHandlerOptions {
   readonly config: ApprovalConfig;
@@ -88,12 +89,17 @@ export function createArticleApprovalWorkHandler(options: ArticleApprovalWorkHan
     maxParallelCalls: options.config.qwen.maxParallelCalls,
     maxQueuedCalls: options.config.qwen.maxQueuedCalls
   });
+  const telemetry = bestEffortTelemetrySink(options.telemetry);
 
   return {
     name: "article-approval-work-handler",
     handle: (context, tools) => handleApproval(context, tools, {
-      ...options,
-      qwenLimiter
+      config: options.config,
+      dependencies: options.dependencies,
+      qwenLimiter,
+      ...(telemetry === undefined ? {} : {
+        telemetry
+      })
     })
   };
 }
@@ -777,12 +783,17 @@ async function emitDecisionTelemetry(
   decision: ApprovalStoredDecision,
   reusedDecision: boolean
 ): Promise<void> {
+  const durationMs = measuredDecisionDuration(decision, reusedDecision);
+
   await emitRuntimeTelemetry(options.telemetry, {
     name: "runtime.dependency.observed",
     level: decision.decision === "permanent_failure" ? "warn" : "info",
     at: runtimeNow(options.dependencies.clock),
     stage: "approval",
     queue: APPROVAL_QUEUE,
+    ...(durationMs === undefined ? {} : {
+      durationMs
+    }),
     outcome: decision.decision === "permanent_failure" ? "failure" : "success",
     attributes: {
       event: "approval.article.reviewed",
@@ -796,9 +807,23 @@ async function emitDecisionTelemetry(
       reusedDecision,
       candidateId: decision.candidateId,
       canonicalArticleId: decision.canonicalArticleId,
-      articleVersion: decision.articleVersion
+      articleVersion: decision.articleVersion,
+      latencyMs: decision.latencyMs
     }
   });
+}
+
+function measuredDecisionDuration(
+  decision: ApprovalStoredDecision,
+  reusedDecision: boolean
+): number | undefined {
+  if (reusedDecision
+    || decision.provider !== "local_ai"
+    || decision.rejectionReason === "model_input_too_large") {
+    return undefined;
+  }
+
+  return decision.latencyMs;
 }
 
 function score(value: unknown): value is number {

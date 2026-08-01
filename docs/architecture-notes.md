@@ -13,6 +13,10 @@ This repository owns the approval worker process shell only. It does not own fee
 5. Expose `/live`, `/startup`, `/ready`, `/metrics`, and `/config-schema`.
 6. On shutdown, stop accepting deliveries, wait for in-flight handlers, cancel consumers, and close broker lifecycle.
 
+The service-local input processor mirrors the shared runtime's lifecycle events and retry/DLQ helpers while validating payload ownership by `definition.consumer`. The published runtime `0.5.0` processor validates `definition.stage` instead, which would reject the contracted `enrichmentResult` input because it is produced by `enrichment` and consumed by `approval`. Keep this compatibility adapter until the shared runtime exposes consumer-based payload validation.
+
+Telemetry sinks are isolated at application, work-handler, transport, and service boundaries. Synchronous throws and rejected emission promises are swallowed independently because logs and metrics are non-semantic: they cannot change idempotency records, acknowledgement, retry, or DLQ decisions. Compatibility probe gauges initialize to liveness OK with startup/readiness unhealthy, then follow observed lifecycle state.
+
 ## AI Readiness
 
 Qwen readiness is a readiness dependency, not a liveness dependency. A degraded model endpoint must remove the worker from delivery readiness without causing process restarts by itself.

@@ -105,6 +105,7 @@ describe("production approval dependencies", () => {
 
 function productionEnv(): NodeJS.ProcessEnv {
   return {
+    NUTSNEWS_APPROVAL_BUILD_REVISION: "0123456789abcdef0123456789abcdef01234567",
     NUTSNEWS_APPROVAL_DATABASE_URL: "postgres://approval:secret@example.invalid:5432/nutsnews",
     NUTSNEWS_APPROVAL_RABBITMQ_URL: "amqp://approval:secret@example.invalid:5672",
     NUTSNEWS_APPROVAL_QWEN_BASE_URL: "https://ai.example.test",

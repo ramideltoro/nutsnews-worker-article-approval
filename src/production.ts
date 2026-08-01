@@ -76,6 +76,7 @@ import {
   type ApprovalReconciliationRequest,
   type ApprovalReconciler
 } from "./reconciliation.js";
+import { bestEffortTelemetrySink } from "./telemetry.js";
 import { LocalApprovalWorkHandler } from "./test-doubles.js";
 
 const APPROVAL_SCHEMA = "worker_uplift_approval";
@@ -125,6 +126,7 @@ export function createProductionApprovalDependencies(
   options: ProductionApprovalDependencyOptions
 ): ProductionApprovalDependencies {
   const env = options.env ?? process.env;
+  const telemetry = bestEffortTelemetrySink(options.telemetry);
   const pool = new Pool({
     connectionString: requiredEnv(env, "NUTSNEWS_APPROVAL_DATABASE_URL"),
     max: Math.max(2, options.config.concurrency + 1),
@@ -134,8 +136,8 @@ export function createProductionApprovalDependencies(
     url: requiredEnv(env, "NUTSNEWS_APPROVAL_RABBITMQ_URL"),
     prefetch: options.config.prefetch,
     clock: options.clock,
-    ...(options.telemetry === undefined ? {} : {
-      telemetry: options.telemetry
+    ...(telemetry === undefined ? {} : {
+      telemetry
     })
   });
   const stateStore = new PostgresApprovalStateStore(pool);
@@ -203,7 +205,7 @@ export class PayloadRabbitMqTransport implements RuntimeBrokerTransport {
     this.url = options.url;
     this.prefetchCount = options.prefetch;
     this.clock = options.clock;
-    this.telemetry = options.telemetry;
+    this.telemetry = bestEffortTelemetrySink(options.telemetry);
     this.connectToBroker = options.connect ?? amqpConnect;
   }
 

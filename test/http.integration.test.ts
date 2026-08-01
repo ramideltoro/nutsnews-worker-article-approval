@@ -1,4 +1,3 @@
-import { createPrometheusRuntimeTelemetrySink } from "@ramideltoro/nutsnews-worker-runtime";
 import {
   afterEach,
   describe,
@@ -11,12 +10,16 @@ import {
   createApprovalHttpServer,
   type ApprovalHttpServer
 } from "../src/http.js";
+import { createApprovalPrometheusTelemetrySink } from "../src/metrics.js";
 import type {
   ApprovalReconciliationReport,
   ApprovalReconciler
 } from "../src/reconciliation.js";
 import { createApprovalService } from "../src/service.js";
-import { createLocalApprovalDependencies } from "../src/test-doubles.js";
+import {
+  createLocalApprovalDependencies,
+  createMinimalApprovalDelivery
+} from "../src/test-doubles.js";
 
 let activeServer: ApprovalHttpServer | undefined;
 
@@ -34,7 +37,7 @@ describe("approval HTTP endpoints", () => {
       NUTSNEWS_APPROVAL_HTTP_PORT: "0",
       NUTSNEWS_APPROVAL_TELEMETRY_LOGS: "silent"
     });
-    const metrics = createPrometheusRuntimeTelemetrySink({
+    const metrics = createApprovalPrometheusTelemetrySink({
       identity: {
         service: config.serviceName,
         version: config.serviceVersion,
@@ -42,9 +45,11 @@ describe("approval HTTP endpoints", () => {
         host: config.host
       }
     });
+    const dependencies = createLocalApprovalDependencies();
     const service = createApprovalService({
       config,
-      dependencies: createLocalApprovalDependencies(),
+      dependencies,
+      telemetry: metrics,
       metrics
     });
     activeServer = createApprovalHttpServer({
@@ -54,6 +59,7 @@ describe("approval HTTP endpoints", () => {
     });
 
     await service.start();
+    await service.processDelivery(createMinimalApprovalDelivery());
     await activeServer.listen();
 
     await expectJsonStatus(activeServer.url("/live"), 200, "ok");
@@ -62,7 +68,14 @@ describe("approval HTTP endpoints", () => {
 
     const metricsResponse = await fetch(activeServer.url("/metrics"));
     expect(metricsResponse.status).toBe(200);
-    expect(await metricsResponse.text()).toContain("nutsnews_worker_dependency_duration_ms");
+    const metricsBody = await metricsResponse.text();
+    expect(metricsBody).not.toContain("nutsnews_worker_dependency_duration_ms");
+    expect(metricsBody).toContain("nutsnews_worker_uplift_stage_events_total");
+    expect(metricsBody).toContain('nutsnews_worker_uplift_stage_latency_seconds_bucket{environment="local",service="approval",le="30"} 1');
+    expect(metricsBody).toContain('nutsnews_worker_expected_active{environment="local",service="approval"} 0');
+    expect(metricsBody).toContain('nutsnews_worker_health_probe{environment="local",service="approval",probe="liveness",outcome="ok"} 1');
+    expect(metricsBody).toContain('nutsnews_worker_health_probe{environment="local",service="approval",probe="startup",outcome="ok"} 1');
+    expect(metricsBody).toContain('nutsnews_worker_health_probe{environment="local",service="approval",probe="readiness",outcome="ok"} 1');
 
     const schemaResponse = await fetch(activeServer.url("/config-schema"));
     expect(schemaResponse.status).toBe(200);

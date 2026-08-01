@@ -3,8 +3,7 @@ import {
   STAGE_PAYLOAD_SCHEMA_VERSION
 } from "@ramideltoro/nutsnews-worker-contracts";
 import {
-  createBufferedRuntimeTelemetrySink,
-  createPrometheusRuntimeTelemetrySink
+  createBufferedRuntimeTelemetrySink
 } from "@ramideltoro/nutsnews-worker-runtime";
 import {
   describe,
@@ -13,6 +12,7 @@ import {
 } from "vitest";
 
 import { loadApprovalConfig } from "../src/config.js";
+import { createApprovalPrometheusTelemetrySink } from "../src/metrics.js";
 import { createApprovalService } from "../src/service.js";
 import {
   InMemoryApprovalStateStore,
@@ -41,7 +41,7 @@ describe("createApprovalService", () => {
     expect((await context.service.health.liveness()).status).toBe("ok");
     expect((await context.service.health.startup()).status).toBe("ok");
     expect((await context.service.health.readiness()).status).toBe("ok");
-    expect(context.metrics.collect()).toContain("nutsnews_worker_dependency_duration_ms");
+    expect(context.metrics.collect()).not.toContain("nutsnews_worker_dependency_duration_ms");
 
     await context.service.stop();
 
@@ -162,7 +162,7 @@ function createServiceContext() {
   });
   const dependencies = createLocalApprovalDependencies();
   const telemetry = createBufferedRuntimeTelemetrySink();
-  const metrics = createPrometheusRuntimeTelemetrySink({
+  const metrics = createApprovalPrometheusTelemetrySink({
     identity: {
       service: config.serviceName,
       version: config.serviceVersion,

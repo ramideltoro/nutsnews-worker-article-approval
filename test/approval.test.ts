@@ -127,9 +127,19 @@ describe("createArticleApprovalWorkHandler", () => {
     expect(context.outbox.records).toHaveLength(1);
 
     const telemetryJson = JSON.stringify(context.telemetry.events);
+    const decisionTelemetry = context.telemetry.events.find(
+      (event) => event.name === "runtime.dependency.observed"
+        && event.attributes?.event === "approval.article.reviewed"
+    );
 
     expect(telemetryJson).not.toContain(summary);
     expect(telemetryJson).not.toContain(context.qwenClient.requests[0]?.prompt.instructions);
+    expect(decisionTelemetry).toMatchObject({
+      durationMs: 37,
+      attributes: {
+        latencyMs: 37
+      }
+    });
   });
 
   it("records valid rejected Qwen decisions without publishing translation work", async () => {
@@ -163,6 +173,64 @@ describe("createArticleApprovalWorkHandler", () => {
     expect(context.broker.published).toHaveLength(0);
   });
 
+  it.each([
+    "throw",
+    "reject"
+  ] as const)("keeps a decision telemetry %s from changing persistence, publication, or duplicate acknowledgement", async (failureMode) => {
+    const clock = new ManualApprovalClock();
+    const config = loadApprovalConfig({
+      NUTSNEWS_APPROVAL_HTTP_PORT: "0",
+      NUTSNEWS_APPROVAL_TELEMETRY_LOGS: "silent"
+    });
+    const baseDependencies = createLocalApprovalDependencies({
+      clock
+    });
+    const telemetry = {
+      emit: (): void | Promise<void> => {
+        if (failureMode === "throw") {
+          throw new Error("decision telemetry unavailable");
+        }
+
+        return Promise.reject(new Error("decision telemetry unavailable"));
+      }
+    };
+    const dependencies = {
+      ...baseDependencies,
+      workHandler: createArticleApprovalWorkHandler({
+        config,
+        dependencies: baseDependencies,
+        telemetry
+      })
+    };
+    const service = createApprovalService({
+      config,
+      dependencies
+    });
+    const broker = dependencies.brokerTransport as LocalBrokerTransport;
+    const stateStore = dependencies.stateStore as InMemoryApprovalStateStore;
+    const qwenClient = dependencies.qwenClient as LocalApprovalQwenClient;
+    const delivery = {
+      envelope: createMinimalApprovalEnvelope(),
+      payload: createMinimalApprovalPayload(),
+      receivedAt: "2026-07-23T00:00:01.000Z"
+    };
+
+    await service.start();
+    await expect(broker.deliverApproval(delivery)).resolves.toMatchObject({
+      action: "ack",
+      reason: "handled"
+    });
+    await expect(broker.deliverApproval(delivery)).resolves.toMatchObject({
+      action: "ack",
+      reason: "duplicate"
+    });
+    await service.stop();
+
+    expect(stateStore.decisions).toHaveLength(1);
+    expect(qwenClient.requests).toHaveLength(1);
+    expect(broker.published).toHaveLength(1);
+  });
+
   it("rejects no-thumbnail enrichment results before calling Qwen", async () => {
     const context = createApprovalContext();
     const noThumbnailPayload = withoutImageUrl(createMinimalApprovalPayload({
@@ -189,6 +257,10 @@ describe("createArticleApprovalWorkHandler", () => {
       provider: "prefilter"
     });
     expect(context.broker.published).toHaveLength(0);
+    expect(context.telemetry.events.find(
+      (event) => event.name === "runtime.dependency.observed"
+        && event.attributes?.event === "approval.article.reviewed"
+    )?.durationMs).toBeUndefined();
   });
 
   it("stores invalid Qwen schemas as permanent failures without publishing translation work", async () => {
@@ -344,7 +416,11 @@ describe("createArticleApprovalWorkHandler", () => {
     expect(context.stateStore.decisions).toHaveLength(1);
     expect(context.broker.published).toHaveLength(1);
     expect(context.outbox.records).toHaveLength(1);
-    expect(context.telemetry.events.some((event) => event.attributes?.reusedDecision === true)).toBe(true);
+    const reusedDecisionTelemetry = context.telemetry.events.find(
+      (event) => event.attributes?.reusedDecision === true
+    );
+    expect(reusedDecisionTelemetry).toBeDefined();
+    expect(reusedDecisionTelemetry?.durationMs).toBeUndefined();
   });
 
   it("limits parallel Qwen calls while queued deliveries wait for capacity", async () => {

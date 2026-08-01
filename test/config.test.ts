@@ -18,6 +18,7 @@ describe("loadApprovalConfig", () => {
     expect(config).toMatchObject({
       serviceName: "nutsnews-worker-article-approval",
       dependencyMode: "test",
+      buildRevision: "development",
       host: "approval-host",
       concurrency: 2,
       prefetch: 4,
@@ -75,7 +76,8 @@ describe("loadApprovalConfig", () => {
         "NUTSNEWS_APPROVAL_DATABASE_URL is required when NUTSNEWS_APPROVAL_DEPENDENCY_MODE=production.",
         "NUTSNEWS_APPROVAL_RABBITMQ_URL is required when NUTSNEWS_APPROVAL_DEPENDENCY_MODE=production.",
         "NUTSNEWS_APPROVAL_QWEN_BASE_URL is required when NUTSNEWS_APPROVAL_DEPENDENCY_MODE=production.",
-        "NUTSNEWS_APPROVAL_QWEN_API_KEY is required when NUTSNEWS_APPROVAL_DEPENDENCY_MODE=production."
+        "NUTSNEWS_APPROVAL_QWEN_API_KEY is required when NUTSNEWS_APPROVAL_DEPENDENCY_MODE=production.",
+        "NUTSNEWS_APPROVAL_BUILD_REVISION must be a lowercase 40-character Git commit SHA when NUTSNEWS_APPROVAL_DEPENDENCY_MODE=production."
       ]);
       expect(configError.message).not.toContain("postgres://");
       expect(configError.message).not.toContain("amqp://");
@@ -153,6 +155,7 @@ describe("loadApprovalConfig", () => {
   it("accepts explicit production dependency presence without retaining sensitive values", () => {
     const config = loadApprovalConfig({
       NUTSNEWS_APPROVAL_DEPENDENCY_MODE: "production",
+      NUTSNEWS_APPROVAL_BUILD_REVISION: "0123456789abcdef0123456789abcdef01234567",
       NUTSNEWS_APPROVAL_DATABASE_URL: "postgres://example.invalid/worker",
       NUTSNEWS_APPROVAL_RABBITMQ_URL: "amqp://example.invalid",
       NUTSNEWS_APPROVAL_QWEN_BASE_URL: "https://qwen.internal.invalid/v1",
@@ -166,6 +169,7 @@ describe("loadApprovalConfig", () => {
       qwenEndpointConfigured: true,
       qwenCredentialConfigured: true
     });
+    expect(config.buildRevision).toBe("0123456789abcdef0123456789abcdef01234567");
     expect(JSON.stringify(config)).not.toContain("postgres://example.invalid");
     expect(JSON.stringify(config)).not.toContain("amqp://example.invalid");
     expect(JSON.stringify(config)).not.toContain("qwen.internal.invalid");

@@ -3,8 +3,7 @@ import { timingSafeEqual } from "node:crypto";
 import type { AddressInfo } from "node:net";
 
 import {
-  runtimeHealthEndpointResponse,
-  type PrometheusRuntimeTelemetrySink
+  runtimeHealthEndpointResponse
 } from "@ramideltoro/nutsnews-worker-runtime";
 
 import {
@@ -16,12 +15,13 @@ import {
   type ApprovalReconciliationRequest,
   type ApprovalReconciler
 } from "./reconciliation.js";
+import type { ApprovalRuntimeMetricsSink } from "./metrics.js";
 import type { ApprovalService } from "./service.js";
 
 export interface ApprovalHttpServerOptions {
   readonly config: ApprovalConfig;
   readonly service: ApprovalService;
-  readonly metrics?: PrometheusRuntimeTelemetrySink;
+  readonly metrics?: ApprovalRuntimeMetricsSink;
   readonly reconciler?: ApprovalReconciler;
   readonly reconciliationToken?: string;
 }
