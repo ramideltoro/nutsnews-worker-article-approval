@@ -39,7 +39,7 @@ import { bestEffortTelemetrySink } from "./telemetry.js";
 
 export interface ArticleApprovalWorkHandlerOptions {
   readonly config: ApprovalConfig;
-  readonly dependencies: ApprovalDependencies;
+  readonly dependencies: Omit<ApprovalDependencies, "workHandler">;
   readonly telemetry?: RuntimeTelemetrySink;
   readonly qwenLimiter?: ApprovalQwenCapacityLimiter;
 }
@@ -109,6 +109,7 @@ async function handleApproval(
   tools: ApprovalWorkTools,
   options: ArticleApprovalWorkHandlerOptions
 ): Promise<RuntimeHandlerResult> {
+  tools.assertOwnership();
   let input: ApprovalEnrichmentRecordInput;
 
   try {
@@ -121,6 +122,7 @@ async function handleApproval(
   }
 
   const prompt = await options.dependencies.promptRegistry.getPrompt(options.config.qwen.promptId);
+  tools.assertOwnership();
   const decisionKey = approvalDecisionKey(input.articleMetadataRef, prompt, options.config);
   const existing = await tools.withTransaction((transaction) => options.dependencies.stateStore.findDecision(decisionKey, transaction));
 
@@ -136,7 +138,7 @@ async function handleApproval(
   const enrichmentRecord = await tools.withTransaction((transaction) => options.dependencies.stateStore.loadEnrichmentRecord(input, transaction));
   const decidedAt = runtimeNow(options.dependencies.clock);
   const decision = enrichmentRecord.imageStatus === "hydrated"
-    ? await modelDecision(context, enrichmentRecord, prompt, decidedAt, options)
+    ? await modelDecision(context, enrichmentRecord, prompt, decidedAt, tools, options)
     : prefilterRejection(context, enrichmentRecord, prompt, decidedAt, options);
 
   if (decision.status !== "decision") {
@@ -147,6 +149,7 @@ async function handleApproval(
 
   await emitDecisionTelemetry(options, recorded, false);
   await publishAcceptedTranslationIfNeeded(context, recorded, tools, options);
+  tools.assertOwnership();
 
   return {
     status: "ok"
@@ -158,6 +161,7 @@ async function modelDecision(
   enrichmentRecord: ApprovalEnrichmentRecord,
   prompt: ApprovalPrompt,
   decidedAt: string,
+  tools: ApprovalWorkTools,
   options: ArticleApprovalWorkHandlerOptions
 ): Promise<
   | {
@@ -187,7 +191,7 @@ async function modelDecision(
     };
   }
 
-  const permit = await options.qwenLimiter?.acquire();
+  const permit = await options.qwenLimiter?.acquire(tools.signal);
 
   if (permit === undefined) {
     return {
@@ -204,8 +208,19 @@ async function modelDecision(
   let raw: unknown;
 
   try {
-    raw = await options.dependencies.qwenClient.review(request);
+    tools.assertOwnership();
+    raw = await options.dependencies.qwenClient.review({
+      ...request,
+      timeoutMs: Math.min(request.timeoutMs, 45_000)
+    }, tools.signal);
+    tools.assertOwnership();
   } catch (error: unknown) {
+    if (tools.signal.aborted) {
+      throw tools.signal.reason instanceof Error
+        ? tools.signal.reason
+        : new Error("Approval claim ownership was aborted during Qwen review.");
+    }
+
     if (isApprovedTransientQwenError(error)) {
       if (error.retryAfterMs === undefined) {
         return {
@@ -421,14 +436,18 @@ async function publishAcceptedTranslationIfNeeded(
   }
 
   const command = translationTaskCommand(context, decision, options.config);
+  tools.assertOwnership();
   const receipt = await tools.publish(command);
 
+  tools.assertOwnership();
   await tools.recordOutbox(command, receipt);
+  tools.assertOwnership();
   await tools.withTransaction((transaction) => options.dependencies.stateStore.markTranslationPublished(decision.decisionId, {
     messageId: receipt.messageId,
     idempotencyKey: command.envelope.idempotencyKey,
     publishedAt: receipt.confirmedAt
   }, transaction));
+  tools.assertOwnership();
 }
 
 function approvalInputFromContext(context: RuntimeMessageContext): ApprovalEnrichmentRecordInput {

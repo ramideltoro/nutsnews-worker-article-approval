@@ -102,6 +102,7 @@ async function routeRequest(
       writeHealth(response, await options.service.health.readiness());
       return;
     case "/metrics":
+      await refreshHealthMetrics(options.service);
       writeText(response, 200, options.metrics?.collect() ?? "", "text/plain; version=0.0.4; charset=utf-8");
       return;
     case "/config-schema":
@@ -116,6 +117,16 @@ async function routeRequest(
         status: "not-found"
       });
   }
+}
+
+async function refreshHealthMetrics(service: ApprovalService): Promise<void> {
+  const health = service.health;
+
+  await Promise.all([
+    health.liveness(),
+    health.startup(),
+    health.readiness()
+  ]);
 }
 
 async function handleReconciliationRequest(

@@ -105,6 +105,7 @@ export class ApprovalConfigError extends Error {
 
 export function loadApprovalConfig(env: NodeJS.ProcessEnv = process.env): ApprovalConfig {
   const issues: string[] = [];
+  const environment = nonEmpty(env.NUTSNEWS_ENVIRONMENT, "local").toLowerCase();
   const dependencyMode = parseDependencyMode(env.NUTSNEWS_APPROVAL_DEPENDENCY_MODE, issues);
   const dependencies = {
     databaseConfigured: hasValue(env.NUTSNEWS_APPROVAL_DATABASE_URL),
@@ -120,6 +121,10 @@ export function loadApprovalConfig(env: NodeJS.ProcessEnv = process.env): Approv
     requireConfigured("NUTSNEWS_APPROVAL_QWEN_API_KEY", dependencies.qwenCredentialConfigured, issues);
   }
 
+  if (environment === "production" && dependencyMode !== "production") {
+    issues.push("NUTSNEWS_APPROVAL_DEPENDENCY_MODE must be production when NUTSNEWS_ENVIRONMENT=production.");
+  }
+
   const buildRevision = parseBuildRevision(env.NUTSNEWS_APPROVAL_BUILD_REVISION, dependencyMode, issues);
 
   const concurrency = parseInteger(env.NUTSNEWS_APPROVAL_CONCURRENCY, "NUTSNEWS_APPROVAL_CONCURRENCY", 2, 1, 16, issues);
@@ -127,7 +132,7 @@ export function loadApprovalConfig(env: NodeJS.ProcessEnv = process.env): Approv
   const config: ApprovalConfig = {
     serviceName: APPROVAL_SERVICE_NAME,
     serviceVersion: APPROVAL_SERVICE_VERSION,
-    environment: nonEmpty(env.NUTSNEWS_ENVIRONMENT, "local"),
+    environment,
     buildRevision,
     host: nonEmpty(env.HOSTNAME, os.hostname()),
     http: {
@@ -243,7 +248,7 @@ function hasValue(value: string | undefined): boolean {
 }
 
 function parseDependencyMode(value: string | undefined, issues: string[]): ApprovalDependencyMode {
-  const normalized = nonEmpty(value, "test");
+  const normalized = nonEmpty(value, "test").toLowerCase();
 
   if (normalized === "test" || normalized === "production") {
     return normalized;

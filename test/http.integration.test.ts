@@ -17,6 +17,7 @@ import type {
 } from "../src/reconciliation.js";
 import { createApprovalService } from "../src/service.js";
 import {
+  LocalApprovalQwenClient,
   createLocalApprovalDependencies,
   createMinimalApprovalDelivery
 } from "../src/test-doubles.js";
@@ -72,10 +73,35 @@ describe("approval HTTP endpoints", () => {
     expect(metricsBody).not.toContain("nutsnews_worker_dependency_duration_ms");
     expect(metricsBody).toContain("nutsnews_worker_uplift_stage_events_total");
     expect(metricsBody).toContain('nutsnews_worker_uplift_stage_latency_seconds_bucket{environment="local",service="approval",le="30"} 1');
-    expect(metricsBody).toContain('nutsnews_worker_expected_active{environment="local",service="approval"} 0');
-    expect(metricsBody).toContain('nutsnews_worker_health_probe{environment="local",service="approval",probe="liveness",outcome="ok"} 1');
-    expect(metricsBody).toContain('nutsnews_worker_health_probe{environment="local",service="approval",probe="startup",outcome="ok"} 1');
-    expect(metricsBody).toContain('nutsnews_worker_health_probe{environment="local",service="approval",probe="readiness",outcome="ok"} 1');
+    expect(metricsBody).toContain('nutsnews_worker_expected_active{environment="local",service="nutsnews-worker-article-approval"} 0');
+    expectMetricSample(metricsBody, "nutsnews_worker_health_probe", {
+      probe: "liveness",
+      outcome: "ok"
+    }, 1);
+    expectMetricSample(metricsBody, "nutsnews_worker_health_probe", {
+      probe: "startup",
+      outcome: "ok"
+    }, 1);
+    expectMetricSample(metricsBody, "nutsnews_worker_health_probe", {
+      probe: "readiness",
+      outcome: "ok"
+    }, 1);
+    expect(metricsBody).toContain('check="qwen-client"');
+    expect(metricsBody).not.toContain('check="other"');
+
+    (dependencies.qwenClient as LocalApprovalQwenClient).status = "unhealthy";
+    const staleSafeMetricsResponse = await fetch(activeServer.url("/metrics"));
+    const staleSafeMetricsBody = await staleSafeMetricsResponse.text();
+
+    expectMetricSample(staleSafeMetricsBody, "nutsnews_worker_health_probe", {
+      probe: "readiness",
+      outcome: "unhealthy"
+    }, 1);
+    expectMetricSample(staleSafeMetricsBody, "nutsnews_worker_health_check", {
+      probe: "readiness",
+      check: "qwen-client",
+      outcome: "unhealthy"
+    }, 1);
 
     const schemaResponse = await fetch(activeServer.url("/config-schema"));
     expect(schemaResponse.status).toBe(200);
@@ -164,6 +190,21 @@ describe("approval HTTP endpoints", () => {
     await service.stop();
   });
 });
+
+function expectMetricSample(
+  output: string,
+  metric: string,
+  labels: Readonly<Record<string, string>>,
+  expectedValue: number
+): void {
+  const matches = output
+    .split("\n")
+    .filter((line) => line.startsWith(`${metric}{`)
+      && Object.entries(labels).every(([name, value]) => line.includes(`${name}="${value}"`)));
+
+  expect(matches).toHaveLength(1);
+  expect(Number(matches[0]?.split(" ").at(-1))).toBe(expectedValue);
+}
 
 async function expectJsonStatus(url: string, statusCode: number, status: string): Promise<void> {
   const response = await fetch(url);

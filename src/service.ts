@@ -77,14 +77,34 @@ export function createApprovalService(options: ApprovalServiceOptions): Approval
       telemetry
     }),
     handler: async (context) => {
+      const ownership = options.dependencies.stateStore.ownership(context.envelope.idempotencyKey);
+
       try {
         return await drain.track(async () => {
           setInFlight(options.metrics, approvalRoute.mainQueue.name, drain.inFlight);
+          ownership.assertOwned();
           const result = await options.dependencies.workHandler.handle(context, {
-            publish: (command) => broker.publish(command),
-            recordOutbox: (command, receipt) => options.dependencies.brokerOutbox.record(command, receipt),
-            withTransaction: (operation) => options.dependencies.transactionRunner.withTransaction(operation)
+            signal: ownership.signal,
+            assertOwnership: () => ownership.assertOwned(),
+            publish: async (command) => {
+              ownership.assertOwned();
+              const receipt = await options.dependencies.brokerTransport.publishOwned(command, ownership.signal);
+              ownership.assertOwned();
+              return receipt;
+            },
+            recordOutbox: async (command, receipt) => {
+              ownership.assertOwned();
+              await options.dependencies.brokerOutbox.record(command, receipt, ownership.signal);
+              ownership.assertOwned();
+            },
+            withTransaction: async (operation) => {
+              ownership.assertOwned();
+              const value = await options.dependencies.transactionRunner.withTransaction(operation, ownership.signal);
+              ownership.assertOwned();
+              return value;
+            }
           });
+          ownership.assertOwned();
 
           await emitRuntimeTelemetry(telemetry, {
             name: "runtime.dependency.observed",
@@ -123,6 +143,8 @@ export function createApprovalService(options: ApprovalServiceOptions): Approval
           startupCheck(() => started)
         ],
         readinessChecks: [
+          productionDependencyModeCheck(options.config),
+          dependencyAdapterModeCheck(options.config, options.dependencies.adapterMode),
           brokerReadinessCheck(broker),
           createBrokerConsumerReadinessCheck(broker, "approval"),
           dependencyReadinessCheck("approval-state", options.dependencies.stateStore),
@@ -154,13 +176,18 @@ export function createApprovalService(options: ApprovalServiceOptions): Approval
         return;
       }
 
+      assertSafeDependencyComposition(options.config, options.dependencies.adapterMode);
       await broker.start();
       const brokerConsumer = await broker.consume("approval", processor);
       consumer = {
         stage: brokerConsumer.stage,
         cancel: async () => {
           await brokerConsumer.cancel();
-          setHealthProbe(options.metrics, "readiness", "unhealthy");
+          await refreshHealthProbeBestEffort(
+            "readiness",
+            () => service.health.readiness(),
+            options.metrics
+          );
         }
       };
       started = true;
@@ -182,26 +209,45 @@ export function createApprovalService(options: ApprovalServiceOptions): Approval
           shadowMode: options.config.shadowMode
         }
       });
-      await refreshReadinessBestEffort(
-        () => service.health.readiness(),
-        options.metrics
-      );
+      await refreshHealthMetricsBestEffort(service.health, options.metrics);
     },
     async stop(): Promise<void> {
       if (!started && broker.state === "closed") {
         return;
       }
 
+      const cancelConsumer = consumer?.cancel();
       drain.stopAcceptingWork();
       setShutdownDraining(options.metrics, true);
-      await drain.waitForDrain(options.config.shutdownTimeoutMs);
-      await broker.stop("shutdown");
-      setShutdownDraining(options.metrics, false);
-      setInFlight(options.metrics, approvalRoute.mainQueue.name, drain.inFlight);
-      setHealthProbe(options.metrics, "startup", "unhealthy");
-      setHealthProbe(options.metrics, "readiness", "unhealthy");
-      consumer = undefined;
-      started = false;
+      let drainFailure: Error | undefined;
+
+      try {
+        await cancelConsumer;
+        try {
+          await drain.waitForDrain(options.config.shutdownTimeoutMs);
+        } catch (error: unknown) {
+          drainFailure = error instanceof Error
+            ? error
+            : new Error("Approval service failed while draining in-flight work.");
+          await options.dependencies.stateStore.abortActiveClaims(
+            "Approval service shutdown exceeded the in-flight drain deadline."
+          );
+        }
+
+        await broker.stop("shutdown");
+      } finally {
+        setShutdownDraining(options.metrics, false);
+        setInFlight(options.metrics, approvalRoute.mainQueue.name, drain.inFlight);
+        setHealthProbe(options.metrics, "startup", "unhealthy");
+        setHealthProbe(options.metrics, "readiness", "unhealthy");
+        consumer = undefined;
+        started = false;
+        await refreshHealthMetricsBestEffort(service.health, options.metrics);
+      }
+
+      if (drainFailure !== undefined) {
+        throw drainFailure;
+      }
     },
     processDelivery(delivery: RuntimeMessageDelivery): Promise<RuntimeMessageProcessingResult> {
       return processor(delivery);
@@ -257,14 +303,26 @@ function observeHealthProbes(
   };
 }
 
-async function refreshReadinessBestEffort(
+async function refreshHealthMetricsBestEffort(
+  probes: RuntimeHealthProbeSet,
+  metrics: ApprovalRuntimeMetricsSink | undefined
+): Promise<void> {
+  await Promise.all([
+    refreshHealthProbeBestEffort("liveness", () => probes.liveness(), metrics),
+    refreshHealthProbeBestEffort("startup", () => probes.startup(), metrics),
+    refreshHealthProbeBestEffort("readiness", () => probes.readiness(), metrics)
+  ]);
+}
+
+async function refreshHealthProbeBestEffort(
+  probe: "liveness" | "startup" | "readiness",
   operation: () => Promise<RuntimeHealthReport>,
   metrics: ApprovalRuntimeMetricsSink | undefined
 ): Promise<void> {
   try {
     await operation();
   } catch {
-    setHealthProbe(metrics, "readiness", "unhealthy");
+    setHealthProbe(metrics, probe, "unhealthy");
   }
 }
 
@@ -290,6 +348,68 @@ function startupCheck(isStarted: () => boolean): RuntimeHealthCheck {
     critical: true,
     check: () => isStarted() ? "ok" : "unhealthy"
   };
+}
+
+function productionDependencyModeCheck(config: ApprovalConfig): RuntimeHealthCheck {
+  return {
+    name: "production-dependency-mode",
+    critical: true,
+    check: () => normalizedMode(config.environment) !== "production"
+      || normalizedMode(config.dependencyMode) === "production"
+      ? "ok"
+      : {
+          status: "unhealthy",
+          details: {
+            environment: config.environment,
+            dependencyMode: config.dependencyMode
+          }
+        }
+  };
+}
+
+function dependencyAdapterModeCheck(
+  config: ApprovalConfig,
+  adapterMode: ApprovalDependencies["adapterMode"]
+): RuntimeHealthCheck {
+  return {
+    name: "dependency-adapter-mode",
+    critical: true,
+    check: () => normalizedMode(config.dependencyMode) !== "production"
+      || normalizedMode(adapterMode) === "production"
+      ? "ok"
+      : {
+          status: "unhealthy",
+          details: {
+            dependencyMode: config.dependencyMode,
+            adapterMode
+          }
+        }
+  };
+}
+
+function assertSafeDependencyComposition(
+  config: ApprovalConfig,
+  adapterMode: ApprovalDependencies["adapterMode"]
+): void {
+  const environment = normalizedMode(config.environment);
+  const dependencyMode = normalizedMode(config.dependencyMode);
+  const actualAdapterMode = normalizedMode(adapterMode);
+
+  if (!config.shadowMode) {
+    throw new Error("Approval startup refused: this worker must remain in shadow mode.");
+  }
+
+  if (environment === "production" && dependencyMode !== "production") {
+    throw new Error("Approval startup refused: production environment requires production dependency mode.");
+  }
+
+  if (dependencyMode === "production" && actualAdapterMode !== "production") {
+    throw new Error("Approval startup refused: production dependency mode requires production adapters.");
+  }
+}
+
+function normalizedMode(value: string): string {
+  return value.trim().toLowerCase();
 }
 
 function brokerReadinessCheck(broker: BrokerLifecycle): RuntimeHealthCheck {

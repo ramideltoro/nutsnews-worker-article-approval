@@ -5,7 +5,7 @@ export interface ApprovalQwenCapacityPermit {
 export interface ApprovalQwenCapacityLimiter {
   readonly activeCount: number;
   readonly queuedCount: number;
-  acquire(): Promise<ApprovalQwenCapacityPermit | undefined>;
+  acquire(signal?: AbortSignal): Promise<ApprovalQwenCapacityPermit | undefined>;
 }
 
 export interface ApprovalQwenCapacityLimiterOptions {
@@ -13,11 +13,16 @@ export interface ApprovalQwenCapacityLimiterOptions {
   readonly maxQueuedCalls: number;
 }
 
-type PermitResolver = (permit: ApprovalQwenCapacityPermit) => void;
+interface PermitWaiter {
+  readonly resolve: (permit: ApprovalQwenCapacityPermit) => void;
+  readonly reject: (reason: unknown) => void;
+  readonly signal?: AbortSignal;
+  readonly onAbort?: () => void;
+}
 
 export class InMemoryApprovalQwenCapacityLimiter implements ApprovalQwenCapacityLimiter {
   private active = 0;
-  private readonly waiting: PermitResolver[] = [];
+  private readonly waiting: PermitWaiter[] = [];
 
   constructor(private readonly options: ApprovalQwenCapacityLimiterOptions) {}
 
@@ -29,7 +34,9 @@ export class InMemoryApprovalQwenCapacityLimiter implements ApprovalQwenCapacity
     return this.waiting.length;
   }
 
-  acquire(): Promise<ApprovalQwenCapacityPermit | undefined> {
+  acquire(signal?: AbortSignal): Promise<ApprovalQwenCapacityPermit | undefined> {
+    throwIfAborted(signal);
+
     if (this.active < this.options.maxParallelCalls) {
       this.active += 1;
 
@@ -40,8 +47,32 @@ export class InMemoryApprovalQwenCapacityLimiter implements ApprovalQwenCapacity
       return Promise.resolve(undefined);
     }
 
-    return new Promise((resolve) => {
-      this.waiting.push(resolve);
+    return new Promise((resolve, reject) => {
+      const waiter: PermitWaiter = {
+        resolve,
+        reject,
+        ...(signal === undefined ? {} : {
+          signal,
+          onAbort: () => {
+            const index = this.waiting.indexOf(waiter);
+
+            if (index !== -1) {
+              this.waiting.splice(index, 1);
+            }
+            reject(abortReason(signal));
+          }
+        })
+      };
+
+      this.waiting.push(waiter);
+      if (signal !== undefined && waiter.onAbort !== undefined) {
+        signal.addEventListener("abort", waiter.onAbort, {
+          once: true
+        });
+        if (signal.aborted) {
+          waiter.onAbort();
+        }
+      }
     });
   }
 
@@ -68,6 +99,19 @@ export class InMemoryApprovalQwenCapacityLimiter implements ApprovalQwenCapacity
       return;
     }
 
-    next(this.createPermit());
+    if (next.onAbort !== undefined) {
+      next.signal?.removeEventListener("abort", next.onAbort);
+    }
+    next.resolve(this.createPermit());
   }
+}
+
+function throwIfAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted === true) {
+    throw abortReason(signal);
+  }
+}
+
+function abortReason(signal: AbortSignal): Error {
+  return signal.reason instanceof Error ? signal.reason : new Error("Approval Qwen capacity wait was aborted.");
 }

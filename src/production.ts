@@ -52,7 +52,10 @@ import {
 import type { ApprovalConfig } from "./config.js";
 import {
   ApprovalQwenError,
+  ApprovalClaimOwnershipError,
+  type ApprovalClaimOwnership,
   type ApprovalBrokerOutbox,
+  type ApprovalBrokerTransport,
   type ApprovalDatabaseTransaction,
   type ApprovalDatabaseTransactionRunner,
   type ApprovalDependencies,
@@ -66,10 +69,10 @@ import {
   type ApprovalQwenRequest,
   type ApprovalStateStore,
   type ApprovalStoredDecision,
-  type ApprovalTranslationPublication,
-  type ApprovalWorkHandler
+  type ApprovalTranslationPublication
 } from "./dependencies.js";
 import { stableUuid } from "./ids.js";
+import { createArticleApprovalWorkHandler } from "./approval.js";
 import {
   APPROVAL_RECONCILIATION_CONFIRMATION,
   type ApprovalReconciliationCandidate,
@@ -78,13 +81,15 @@ import {
   type ApprovalReconciler
 } from "./reconciliation.js";
 import { bestEffortTelemetrySink } from "./telemetry.js";
-import { LocalApprovalWorkHandler } from "./test-doubles.js";
 
 const APPROVAL_SCHEMA = "worker_uplift_approval";
 const DEFAULT_PROMPT_VERSION = "0.1.0";
 const DEFAULT_CONFIRM_TIMEOUT_MS = WORKER_DELIVERY_BEHAVIOR.confirmTimeoutMs;
 const DEFAULT_DRAIN_TIMEOUT_MS = 30_000;
 export const APPROVAL_IDEMPOTENCY_LEASE_SECONDS = 5 * 60;
+export const APPROVAL_IDEMPOTENCY_RENEWAL_INTERVAL_MS = 60_000;
+export const APPROVAL_OWNED_OPERATION_TIMEOUT_MS = 45_000;
+const APPROVAL_RENEWAL_QUERY_TIMEOUT_MS = 10_000;
 
 export type ProductionApprovalDependencies = ApprovalDependencies & {
   readonly reconciler: ApprovalReconciler;
@@ -97,7 +102,6 @@ interface ProductionApprovalDependencyOptions {
   readonly clock: RuntimeClock;
   readonly telemetry?: RuntimeTelemetrySink;
   readonly env?: NodeJS.ProcessEnv;
-  readonly workHandler?: ApprovalWorkHandler;
 }
 
 interface PayloadCarrier {
@@ -115,6 +119,20 @@ interface PgApprovalTransaction extends ApprovalDatabaseTransaction {
   readonly client: PoolClient;
 }
 
+interface ActiveApprovalClaim {
+  readonly idempotencyKey: string;
+  readonly claimToken: string;
+  readonly controller: AbortController;
+  timer: ReturnType<typeof setTimeout> | undefined;
+  renewal: Promise<void> | undefined;
+  stopped: boolean;
+}
+
+interface ApprovalHeartbeatOptions {
+  readonly renewalIntervalMs?: number;
+  readonly renewalQueryTimeoutMs?: number;
+}
+
 interface LocalAiUsage {
   readonly inputTokens: number;
   readonly outputTokens: number;
@@ -122,7 +140,7 @@ interface LocalAiUsage {
 }
 
 type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
-type RabbitMqConnect = (url: string) => Promise<ChannelModel>;
+type RabbitMqConnect = (url: string, socketOptions?: Readonly<Record<string, unknown>>) => Promise<ChannelModel>;
 
 export function createProductionApprovalDependencies(
   options: ProductionApprovalDependencyOptions
@@ -131,8 +149,16 @@ export function createProductionApprovalDependencies(
   const telemetry = bestEffortTelemetrySink(options.telemetry);
   const pool = new Pool({
     connectionString: requiredEnv(env, "NUTSNEWS_APPROVAL_DATABASE_URL"),
-    max: Math.max(2, options.config.concurrency + 1),
-    application_name: options.config.serviceName
+    // A delivery acquires its idempotency lease before business work begins. Keep
+    // enough connections for every prefetched claim plus dedicated heartbeat
+    // traffic so queued work cannot starve lease renewal behind business queries.
+    max: Math.max(4, options.config.prefetch + 2),
+    application_name: options.config.serviceName,
+    connectionTimeoutMillis: 10_000,
+    query_timeout: APPROVAL_OWNED_OPERATION_TIMEOUT_MS,
+    statement_timeout: APPROVAL_OWNED_OPERATION_TIMEOUT_MS,
+    lock_timeout: 10_000,
+    idle_in_transaction_session_timeout: APPROVAL_OWNED_OPERATION_TIMEOUT_MS
   });
   const brokerTransport = new PayloadRabbitMqTransport({
     url: requiredEnv(env, "NUTSNEWS_APPROVAL_RABBITMQ_URL"),
@@ -159,28 +185,40 @@ export function createProductionApprovalDependencies(
     clock: options.clock
   });
   const promptRegistry = new StaticApprovalPromptRegistry(options.config.qwen.promptId);
-
-  return {
+  const handlerDependencies = {
+    adapterMode: "production",
     clock: options.clock,
     stateStore,
     transactionRunner,
     brokerOutbox,
+    brokerTransport,
+    qwenClient,
+    promptRegistry
+  } as const satisfies Omit<ApprovalDependencies, "workHandler">;
+  const workHandler = createArticleApprovalWorkHandler({
+    config: options.config,
+    dependencies: handlerDependencies,
+    ...(telemetry === undefined ? {} : {
+      telemetry
+    })
+  });
+
+  return {
+    ...handlerDependencies,
     reconciler,
     ...(reconciliationToken === undefined ? {} : {
       reconciliationToken
     }),
-    brokerTransport,
-    qwenClient,
-    promptRegistry,
-    workHandler: options.workHandler ?? new LocalApprovalWorkHandler(),
+    workHandler,
     async close(): Promise<void> {
+      await stateStore.close();
       await brokerTransport.close();
       await pool.end();
     }
   };
 }
 
-export class PayloadRabbitMqTransport implements RuntimeBrokerTransport {
+export class PayloadRabbitMqTransport implements ApprovalBrokerTransport {
   readonly name = "rabbitmq-payload-transport";
 
   private readonly url: string;
@@ -230,8 +268,21 @@ export class PayloadRabbitMqTransport implements RuntimeBrokerTransport {
   }
 
   async publish(command: BrokerPublishCommand): Promise<BrokerPublishReceipt> {
+    return this.publishCommand(command);
+  }
+
+  async publishOwned(command: BrokerPublishCommand, signal: AbortSignal): Promise<BrokerPublishReceipt> {
+    return this.publishCommand(command, boundedOperationSignal(signal));
+  }
+
+  private async publishCommand(
+    command: BrokerPublishCommand,
+    signal?: AbortSignal
+  ): Promise<BrokerPublishReceipt> {
+    throwIfAborted(signal);
     const route = getWorkerRoute(command.envelope.route);
-    const channel = await this.ensureChannel();
+    const channel = await this.ensureChannel(signal);
+    throwIfAborted(signal);
 
     await publishCarrierWithConfirm(channel, {
       carrier: {
@@ -240,8 +291,12 @@ export class PayloadRabbitMqTransport implements RuntimeBrokerTransport {
       },
       exchange: route.exchange,
       routingKey: route.routingKey,
-      confirmTimeoutMs: DEFAULT_CONFIRM_TIMEOUT_MS
+      confirmTimeoutMs: DEFAULT_CONFIRM_TIMEOUT_MS,
+      ...(signal === undefined ? {} : {
+        signal
+      })
     });
+    throwIfAborted(signal);
 
     return {
       messageId: command.envelope.messageId,
@@ -333,7 +388,8 @@ export class PayloadRabbitMqTransport implements RuntimeBrokerTransport {
     }
   }
 
-  private async ensureChannel(): Promise<ConfirmChannel> {
+  private async ensureChannel(signal?: AbortSignal): Promise<ConfirmChannel> {
+    throwIfAborted(signal);
     if (this.channel !== undefined) {
       return this.channel;
     }
@@ -342,8 +398,22 @@ export class PayloadRabbitMqTransport implements RuntimeBrokerTransport {
       throw new Error("RabbitMQ payload transport is closing.");
     }
 
-    const connection = await this.connectToBroker(this.url);
-    const channel = await connection.createConfirmChannel();
+    const connectionPromise = this.connectToBroker(this.url, {
+      timeout: 10_000
+    });
+    const connection = signal === undefined
+      ? await connectionPromise
+      : await waitForAbort(connectionPromise, signal, (lateConnection) => {
+          void lateConnection.close().catch(() => undefined);
+        });
+    throwIfAborted(signal);
+    const channelPromise = connection.createConfirmChannel();
+    const channel = signal === undefined
+      ? await channelPromise
+      : await waitForAbort(channelPromise, signal, (lateChannel) => {
+          void lateChannel.close().catch(() => undefined);
+        });
+    throwIfAborted(signal);
     this.connection = connection;
     this.channel = channel;
 
@@ -565,37 +635,105 @@ export class PostgresApprovalTransactionRunner implements ApprovalDatabaseTransa
     return probePool(this.pool, "approval transaction database ready");
   }
 
-  async withTransaction<T>(operation: (transaction: ApprovalDatabaseTransaction) => Promise<T>): Promise<T> {
-    const client = await this.pool.connect();
+  async withTransaction<T>(
+    operation: (transaction: ApprovalDatabaseTransaction) => Promise<T>,
+    signal?: AbortSignal
+  ): Promise<T> {
+    const operationSignal = boundedOperationSignal(signal);
+    throwIfAborted(operationSignal);
+    const connection = this.pool.connect();
+    const client = await waitForAbort(connection, operationSignal, (lateClient) => {
+      lateClient.release(true);
+    });
     const transaction: PgApprovalTransaction = {
       transactionId: randomUUID(),
       client
     };
+    const clientState = {
+      released: false
+    };
+    const onAbort = (): void => {
+      if (!clientState.released) {
+        clientState.released = true;
+        client.release(claimAbortReason(operationSignal));
+      }
+    };
+
+    operationSignal.addEventListener("abort", onAbort, {
+      once: true
+    });
 
     try {
+      throwIfAborted(operationSignal);
       await client.query("BEGIN");
+      throwIfAborted(operationSignal);
       const value = await operation(transaction);
+      throwIfAborted(operationSignal);
       await client.query("COMMIT");
+      throwIfAborted(operationSignal);
       return value;
     } catch (error: unknown) {
-      await client.query("ROLLBACK").catch(() => undefined);
+      if (!clientState.released) {
+        await client.query("ROLLBACK").catch(() => undefined);
+      }
       throw error;
     } finally {
-      client.release();
+      operationSignal.removeEventListener("abort", onAbort);
+      if (!clientState.released) {
+        clientState.released = true;
+        client.release();
+      }
     }
   }
 }
 
 export class PostgresApprovalStateStore implements ApprovalStateStore {
   readonly name = "postgres-approval-state";
+  private readonly activeClaims = new Map<string, ActiveApprovalClaim>();
+  private readonly renewalIntervalMs: number;
+  private readonly renewalQueryTimeoutMs: number;
+  private readonly inFlightClaims = new Set<Promise<RuntimeIdempotencyClaimResult>>();
+  private acceptingClaims = true;
 
-  constructor(private readonly pool: Pool) {}
+  constructor(
+    private readonly pool: Pool,
+    options: ApprovalHeartbeatOptions = {}
+  ) {
+    this.renewalIntervalMs = boundedHeartbeatDuration(
+      options.renewalIntervalMs ?? APPROVAL_IDEMPOTENCY_RENEWAL_INTERVAL_MS,
+      "renewalIntervalMs",
+      APPROVAL_IDEMPOTENCY_RENEWAL_INTERVAL_MS
+    );
+    this.renewalQueryTimeoutMs = boundedHeartbeatDuration(
+      options.renewalQueryTimeoutMs ?? APPROVAL_RENEWAL_QUERY_TIMEOUT_MS,
+      "renewalQueryTimeoutMs",
+      APPROVAL_OWNED_OPERATION_TIMEOUT_MS
+    );
+  }
 
   async probe(): Promise<ApprovalDependencyProbe> {
     return probePool(this.pool, "approval state database ready");
   }
 
-  async claim(
+  claim(
+    idempotencyKey: string,
+    context: RuntimeIdempotencyClaimContext
+  ): Promise<RuntimeIdempotencyClaimResult> {
+    if (!this.acceptingClaims) {
+      return Promise.reject(new ApprovalClaimOwnershipError("Approval state store is not accepting new claims."));
+    }
+
+    const operation = this.claimFromDatabase(idempotencyKey, context);
+    this.inFlightClaims.add(operation);
+    void operation.then(() => {
+      this.inFlightClaims.delete(operation);
+    }, () => {
+      this.inFlightClaims.delete(operation);
+    });
+    return operation;
+  }
+
+  private async claimFromDatabase(
     idempotencyKey: string,
     context: RuntimeIdempotencyClaimContext
   ): Promise<RuntimeIdempotencyClaimResult> {
@@ -609,8 +747,8 @@ export class PostgresApprovalStateStore implements ApprovalStateStore {
         $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::timestamptz, 'processing',
         $14::jsonb || jsonb_build_object(
           'idempotencyClaimToken', $15::text,
-          'claimedAt', statement_timestamp(),
-          'idempotencyLeaseAcquiredAtEpochSeconds', extract(epoch FROM statement_timestamp())
+          'claimedAt', clock_timestamp(),
+          'idempotencyLeaseAcquiredAtEpochSeconds', extract(epoch FROM clock_timestamp())
         )
       )
       ON CONFLICT (idempotency_key) DO NOTHING
@@ -639,6 +777,7 @@ export class PostgresApprovalStateStore implements ApprovalStateStore {
     );
 
     if ((inserted.rowCount ?? 0) > 0) {
+      await this.activateClaim(idempotencyKey, claimToken, context);
       return {
         status: "claimed",
         firstSeenAt: context.receivedAt,
@@ -689,9 +828,9 @@ export class PostgresApprovalStateStore implements ApprovalStateStore {
              sanitized_error_message = NULL,
              diagnostic_metadata = diagnostic_metadata || $2::jsonb || jsonb_build_object(
                'idempotencyClaimToken', $3::text,
-               'claimedAt', statement_timestamp(),
-               'idempotencyLeaseAcquiredAtEpochSeconds', extract(epoch FROM statement_timestamp()),
-               'replayedAt', statement_timestamp()
+               'claimedAt', clock_timestamp(),
+               'idempotencyLeaseAcquiredAtEpochSeconds', extract(epoch FROM clock_timestamp()),
+               'replayedAt', clock_timestamp()
              )
          WHERE idempotency_key = $1
            AND status IN ('failed', 'parked')
@@ -707,6 +846,7 @@ export class PostgresApprovalStateStore implements ApprovalStateStore {
       );
 
       if ((replayed.rowCount ?? 0) > 0) {
+        await this.activateClaim(idempotencyKey, claimToken, context);
         return {
           status: "claimed",
           firstSeenAt,
@@ -723,9 +863,9 @@ export class PostgresApprovalStateStore implements ApprovalStateStore {
         `UPDATE ${APPROVAL_SCHEMA}.inbox
          SET diagnostic_metadata = diagnostic_metadata || $2::jsonb || jsonb_build_object(
                'idempotencyClaimToken', $3::text,
-               'claimedAt', statement_timestamp(),
-               'idempotencyLeaseAcquiredAtEpochSeconds', extract(epoch FROM statement_timestamp()),
-               'leaseReclaimedAt', statement_timestamp()
+               'claimedAt', clock_timestamp(),
+               'idempotencyLeaseAcquiredAtEpochSeconds', extract(epoch FROM clock_timestamp()),
+               'leaseReclaimedAt', clock_timestamp()
              )
          WHERE idempotency_key = $1
            AND status = 'processing'
@@ -734,7 +874,7 @@ export class PostgresApprovalStateStore implements ApprovalStateStore {
            AND CASE
              WHEN jsonb_typeof(diagnostic_metadata->'idempotencyLeaseAcquiredAtEpochSeconds') = 'number'
              THEN (diagnostic_metadata->>'idempotencyLeaseAcquiredAtEpochSeconds')::numeric
-               <= extract(epoch FROM statement_timestamp()) - $6::numeric
+               <= extract(epoch FROM clock_timestamp()) - $6::numeric
              ELSE false
            END
          RETURNING received_at`,
@@ -752,6 +892,7 @@ export class PostgresApprovalStateStore implements ApprovalStateStore {
       );
 
       if ((reclaimed.rowCount ?? 0) > 0) {
+        await this.activateClaim(idempotencyKey, claimToken, context);
         return {
           status: "claimed",
           firstSeenAt,
@@ -768,7 +909,18 @@ export class PostgresApprovalStateStore implements ApprovalStateStore {
   }
 
   async markCompleted(idempotencyKey: string, completion: RuntimeIdempotencyCompletion): Promise<void> {
-    const completed = await this.pool.query(
+    try {
+      const active = await this.stopHeartbeat(idempotencyKey, completion.claimToken);
+
+      if (active === undefined) {
+        throw new ApprovalClaimOwnershipError("Cannot complete a claim without matching active ownership.");
+      }
+
+      if (active.controller.signal.aborted) {
+        throw claimAbortReason(active.controller.signal);
+      }
+
+      const completed = await this.pool.query(
       `UPDATE ${APPROVAL_SCHEMA}.inbox
        SET status = 'processed',
            processed_at = $2::timestamptz,
@@ -779,7 +931,7 @@ export class PostgresApprovalStateStore implements ApprovalStateStore {
          AND CASE
            WHEN jsonb_typeof(diagnostic_metadata->'idempotencyLeaseAcquiredAtEpochSeconds') = 'number'
            THEN (diagnostic_metadata->>'idempotencyLeaseAcquiredAtEpochSeconds')::numeric
-             > extract(epoch FROM statement_timestamp()) - $5::numeric
+             > extract(epoch FROM clock_timestamp()) - $5::numeric
            ELSE false
          END
        RETURNING idempotency_key`,
@@ -795,13 +947,18 @@ export class PostgresApprovalStateStore implements ApprovalStateStore {
       ]
     );
 
-    if ((completed.rowCount ?? 0) !== 1) {
-      throw new Error("Cannot complete an idempotency claim owned by another delivery.");
+      if ((completed.rowCount ?? 0) !== 1) {
+        throw new Error("Cannot complete an idempotency claim owned by another delivery.");
+      }
+    } finally {
+      this.finishHeartbeat(idempotencyKey, completion.claimToken);
     }
   }
 
   async markFailed(idempotencyKey: string, failure: RuntimeIdempotencyFailure): Promise<void> {
-    const failed = await this.pool.query(
+    try {
+      await this.stopHeartbeat(idempotencyKey, failure.claimToken);
+      const failed = await this.pool.query(
       `UPDATE ${APPROVAL_SCHEMA}.inbox
        SET status = 'failed',
            sanitized_error_code = $2,
@@ -813,7 +970,7 @@ export class PostgresApprovalStateStore implements ApprovalStateStore {
          AND CASE
            WHEN jsonb_typeof(diagnostic_metadata->'idempotencyLeaseAcquiredAtEpochSeconds') = 'number'
            THEN (diagnostic_metadata->>'idempotencyLeaseAcquiredAtEpochSeconds')::numeric
-             > extract(epoch FROM statement_timestamp()) - $6::numeric
+             > extract(epoch FROM clock_timestamp()) - $6::numeric
            ELSE false
          END
        RETURNING idempotency_key`,
@@ -831,8 +988,11 @@ export class PostgresApprovalStateStore implements ApprovalStateStore {
       ]
     );
 
-    if ((failed.rowCount ?? 0) !== 1) {
-      throw new Error("Cannot fail an idempotency claim owned by another delivery.");
+      if ((failed.rowCount ?? 0) !== 1) {
+        throw new Error("Cannot fail an idempotency claim owned by another delivery.");
+      }
+    } finally {
+      this.finishHeartbeat(idempotencyKey, failure.claimToken);
     }
   }
 
@@ -840,7 +1000,9 @@ export class PostgresApprovalStateStore implements ApprovalStateStore {
     idempotencyKey: string,
     failure: RuntimeIdempotencyFailure
   ): Promise<RuntimeIdempotencyClaimReleaseResult> {
-    const released = await this.pool.query(
+    try {
+      await this.stopHeartbeat(idempotencyKey, failure.claimToken);
+      const released = await this.pool.query(
       `UPDATE ${APPROVAL_SCHEMA}.inbox
        SET status = 'failed',
            sanitized_error_code = $2,
@@ -852,7 +1014,7 @@ export class PostgresApprovalStateStore implements ApprovalStateStore {
          AND CASE
            WHEN jsonb_typeof(diagnostic_metadata->'idempotencyLeaseAcquiredAtEpochSeconds') = 'number'
            THEN (diagnostic_metadata->>'idempotencyLeaseAcquiredAtEpochSeconds')::numeric
-             > extract(epoch FROM statement_timestamp()) - $6::numeric
+             > extract(epoch FROM clock_timestamp()) - $6::numeric
            ELSE false
          END
        RETURNING idempotency_key`,
@@ -871,26 +1033,278 @@ export class PostgresApprovalStateStore implements ApprovalStateStore {
       ]
     );
 
-    if ((released.rowCount ?? 0) === 1) {
-      return {
-        status: "released"
-      };
-    }
+      if ((released.rowCount ?? 0) === 1) {
+        return {
+          status: "released"
+        };
+      }
 
-    const existing = await this.pool.query<{ readonly status: string }>(
+      const existing = await this.pool.query<{ readonly status: string }>(
       `SELECT status
        FROM ${APPROVAL_SCHEMA}.inbox
        WHERE idempotency_key = $1`,
       [idempotencyKey]
     );
 
-    return existing.rows[0]?.status === "processed" || existing.rows[0]?.status === "duplicate"
-      ? {
-          status: "preserved-completed"
+      return existing.rows[0]?.status === "processed" || existing.rows[0]?.status === "duplicate"
+        ? {
+            status: "preserved-completed"
+          }
+        : {
+            status: "not-owned"
+          };
+    } finally {
+      this.finishHeartbeat(idempotencyKey, failure.claimToken);
+    }
+  }
+
+  ownership(idempotencyKey: string): ApprovalClaimOwnership {
+    const active = this.activeClaims.get(idempotencyKey);
+
+    if (active === undefined) {
+      throw new ApprovalClaimOwnershipError("No active PostgreSQL approval claim exists.");
+    }
+
+    return {
+      signal: active.controller.signal,
+      assertOwned: () => {
+        if (this.activeClaims.get(idempotencyKey) !== active
+          || active.stopped
+          || active.controller.signal.aborted) {
+          throw claimAbortReason(active.controller.signal);
         }
-      : {
-          status: "not-owned"
-        };
+      }
+    };
+  }
+
+  async abortActiveClaims(reason: string): Promise<void> {
+    this.acceptingClaims = false;
+    const active = [...this.activeClaims.values()];
+
+    for (const claim of active) {
+      this.abortClaim(claim, new ApprovalClaimOwnershipError(reason));
+    }
+
+    await Promise.allSettled([
+      ...this.inFlightClaims,
+      ...active.flatMap((claim) => claim.renewal === undefined
+        ? []
+        : [
+            claim.renewal
+          ])
+    ]);
+    const remaining = [...this.activeClaims.values()];
+
+    for (const claim of remaining) {
+      this.abortClaim(claim, new ApprovalClaimOwnershipError(reason));
+    }
+
+    await Promise.allSettled(remaining.flatMap((claim) => claim.renewal === undefined
+      ? []
+      : [
+          claim.renewal
+        ]));
+
+    for (const claim of remaining) {
+      if (this.activeClaims.get(claim.idempotencyKey) === claim) {
+        this.activeClaims.delete(claim.idempotencyKey);
+      }
+    }
+  }
+
+  close(): Promise<void> {
+    return this.abortActiveClaims("Approval state store is closing.");
+  }
+
+  private startHeartbeat(idempotencyKey: string, claimToken: string): void {
+    const existing = this.activeClaims.get(idempotencyKey);
+
+    if (existing !== undefined) {
+      this.abortClaim(existing, new ApprovalClaimOwnershipError("Approval idempotency claim was replaced."));
+    }
+
+    const active: ActiveApprovalClaim = {
+      idempotencyKey,
+      claimToken,
+      controller: new AbortController(),
+      timer: undefined,
+      renewal: undefined,
+      stopped: false
+    };
+
+    this.activeClaims.set(idempotencyKey, active);
+
+    if (!this.acceptingClaims) {
+      this.abortClaim(active, new ApprovalClaimOwnershipError("Approval state store is not accepting new claims."));
+      return;
+    }
+
+    this.scheduleRenewal(active);
+  }
+
+  private async activateClaim(
+    idempotencyKey: string,
+    claimToken: string,
+    context: RuntimeIdempotencyClaimContext
+  ): Promise<void> {
+    if (this.acceptingClaims) {
+      this.startHeartbeat(idempotencyKey, claimToken);
+      return;
+    }
+
+    await this.releaseClaim(idempotencyKey, {
+      failedAt: context.receivedAt,
+      messageId: context.envelope.messageId,
+      claimToken,
+      stage: "approval",
+      reason: "approval-state-store-closing",
+      retryable: true
+    }).catch(() => undefined);
+    throw new ApprovalClaimOwnershipError("Approval state store stopped accepting claims during acquisition.");
+  }
+
+  private scheduleRenewal(active: ActiveApprovalClaim): void {
+    if (!this.isActive(active)) {
+      return;
+    }
+
+    active.timer = setTimeout(() => {
+      active.timer = undefined;
+
+      if (!this.isActive(active) || active.renewal !== undefined) {
+        return;
+      }
+
+      const renewal = this.renewClaim(active);
+      active.renewal = renewal;
+      void renewal.then(() => {
+        if (active.renewal === renewal) {
+          active.renewal = undefined;
+        }
+        this.scheduleRenewal(active);
+      }, (error: unknown) => {
+        if (active.renewal === renewal) {
+          active.renewal = undefined;
+        }
+        this.abortClaim(active, error instanceof Error
+          ? error
+          : new ApprovalClaimOwnershipError());
+      });
+    }, this.renewalIntervalMs);
+    active.timer.unref();
+  }
+
+  private async renewClaim(active: ActiveApprovalClaim): Promise<void> {
+    const timeout = new AbortController();
+    const timeoutTimer = setTimeout(() => {
+      timeout.abort(new ApprovalClaimOwnershipError("Approval idempotency lease renewal timed out."));
+    }, this.renewalQueryTimeoutMs);
+    timeoutTimer.unref();
+    const signal = AbortSignal.any([
+      active.controller.signal,
+      timeout.signal
+    ]);
+    let renewed;
+
+    try {
+      renewed = await withAbortablePoolClient(this.pool, signal, async (client) => {
+        await client.query(`SET statement_timeout = ${String(this.renewalQueryTimeoutMs)}`);
+
+        try {
+          return await client.query(
+        `UPDATE ${APPROVAL_SCHEMA}.inbox
+         SET diagnostic_metadata = diagnostic_metadata || jsonb_build_object(
+               'claimedAt', clock_timestamp(),
+               'idempotencyLeaseAcquiredAtEpochSeconds', extract(epoch FROM clock_timestamp()),
+               'leaseRenewedAt', clock_timestamp()
+             )
+         WHERE idempotency_key = $1
+           AND status = 'processing'
+           AND diagnostic_metadata->>'idempotencyClaimToken' = $2
+           AND CASE
+             WHEN jsonb_typeof(diagnostic_metadata->'idempotencyLeaseAcquiredAtEpochSeconds') = 'number'
+             THEN (diagnostic_metadata->>'idempotencyLeaseAcquiredAtEpochSeconds')::numeric
+               > extract(epoch FROM clock_timestamp()) - $3::numeric
+             ELSE false
+           END
+         RETURNING idempotency_key`,
+        [
+          active.idempotencyKey,
+          active.claimToken,
+          APPROVAL_IDEMPOTENCY_LEASE_SECONDS
+            ]
+          );
+        } finally {
+          if (!signal.aborted) {
+            await client.query("RESET statement_timeout");
+          }
+        }
+      });
+    } catch (error: unknown) {
+      if (timeout.signal.aborted && !active.controller.signal.aborted) {
+        throw claimAbortReason(timeout.signal);
+      }
+
+      throw error;
+    } finally {
+      clearTimeout(timeoutTimer);
+    }
+
+    if ((renewed.rowCount ?? 0) !== 1) {
+      throw new ApprovalClaimOwnershipError("Approval idempotency lease renewal lost ownership.");
+    }
+  }
+
+  private async stopHeartbeat(
+    idempotencyKey: string,
+    claimToken: string
+  ): Promise<ActiveApprovalClaim | undefined> {
+    const active = this.activeClaims.get(idempotencyKey);
+
+    if (active?.claimToken !== claimToken) {
+      return undefined;
+    }
+
+    active.stopped = true;
+    if (active.timer !== undefined) {
+      clearTimeout(active.timer);
+      active.timer = undefined;
+    }
+    try {
+      await active.renewal;
+    } catch (error: unknown) {
+      this.abortClaim(active, error instanceof Error
+        ? error
+        : new ApprovalClaimOwnershipError());
+    }
+
+    return active;
+  }
+
+  private finishHeartbeat(idempotencyKey: string, claimToken: string): void {
+    const active = this.activeClaims.get(idempotencyKey);
+
+    if (active?.claimToken === claimToken) {
+      if (active.timer !== undefined) {
+        clearTimeout(active.timer);
+      }
+      this.activeClaims.delete(idempotencyKey);
+    }
+  }
+
+  private abortClaim(active: ActiveApprovalClaim, reason: Error): void {
+    active.stopped = true;
+    if (active.timer !== undefined) {
+      clearTimeout(active.timer);
+      active.timer = undefined;
+    }
+    active.controller.abort(reason);
+  }
+
+  private isActive(active: ActiveApprovalClaim): boolean {
+    return this.activeClaims.get(active.idempotencyKey) === active
+      && !active.stopped
+      && !active.controller.signal.aborted;
   }
 
   loadEnrichmentRecord(
@@ -1040,11 +1454,17 @@ export class PostgresApprovalBrokerOutbox implements ApprovalBrokerOutbox {
     return probePool(this.pool, "approval outbox database ready");
   }
 
-  async record(command: BrokerPublishCommand, receipt: BrokerPublishReceipt): Promise<void> {
+  async record(
+    command: BrokerPublishCommand,
+    receipt: BrokerPublishReceipt,
+    signal?: AbortSignal
+  ): Promise<void> {
     const payload = command.payload;
+    const operationSignal = boundedOperationSignal(signal);
 
-    await this.pool.query(
-      `INSERT INTO ${APPROVAL_SCHEMA}.outbox (
+    await withAbortablePoolClient(this.pool, operationSignal, async (client) => {
+      await client.query(
+        `INSERT INTO ${APPROVAL_SCHEMA}.outbox (
         outbox_message_id, pipeline_run_id, stage_execution_id, destination_stage, routing_key,
         entity_kind, entity_id, schema_version, operation_version, idempotency_key,
         payload_ref, payload_digest, published_at, confirmed_at, status, diagnostic_metadata
@@ -1053,7 +1473,7 @@ export class PostgresApprovalBrokerOutbox implements ApprovalBrokerOutbox {
       DO UPDATE SET confirmed_at = EXCLUDED.confirmed_at,
                     status = 'confirmed',
                     diagnostic_metadata = ${APPROVAL_SCHEMA}.outbox.diagnostic_metadata || EXCLUDED.diagnostic_metadata`,
-      [
+        [
         receipt.messageId,
         stringFrom(payload.pipelineRunId, command.envelope.correlationId),
         stringFrom(payload.stageExecutionId, command.envelope.messageId),
@@ -1074,8 +1494,9 @@ export class PostgresApprovalBrokerOutbox implements ApprovalBrokerOutbox {
           payload,
           payloadSchemaId: payload.schemaId
         })
-      ]
-    );
+        ]
+      );
+    });
   }
 }
 
@@ -1568,7 +1989,7 @@ export class LocalAiApprovalQwenClient implements ApprovalQwenClient {
     }
   }
 
-  async review(request: ApprovalQwenRequest): Promise<unknown> {
+  async review(request: ApprovalQwenRequest, ownershipSignal?: AbortSignal): Promise<unknown> {
     const apiKey = safeHeaderValue(this.apiKey);
 
     if (apiKey === undefined) {
@@ -1578,6 +1999,16 @@ export class LocalAiApprovalQwenClient implements ApprovalQwenClient {
     }
 
     const startedAtMs = this.clock.now().getTime();
+    const timeoutSignal = AbortSignal.timeout(Math.min(
+      request.timeoutMs,
+      APPROVAL_OWNED_OPERATION_TIMEOUT_MS
+    ));
+    const signal = ownershipSignal === undefined
+      ? timeoutSignal
+      : AbortSignal.any([
+          ownershipSignal,
+          timeoutSignal
+        ]);
     let response: Response;
 
     try {
@@ -1594,10 +2025,14 @@ export class LocalAiApprovalQwenClient implements ApprovalQwenClient {
           excerpt: request.input.description ?? request.input.title,
           url: request.input.canonicalUrl
         }),
-        signal: AbortSignal.timeout(request.timeoutMs)
+        signal
       });
     } catch (error: unknown) {
-      if (error instanceof Error && error.name === "TimeoutError") {
+      if (ownershipSignal?.aborted === true) {
+        throw claimAbortReason(ownershipSignal);
+      }
+
+      if (timeoutSignal.aborted || (error instanceof Error && error.name === "TimeoutError")) {
         throw new ApprovalQwenError("qwen-timeout", {
           retryable: true
         });
@@ -1658,6 +2093,123 @@ interface ApprovalDecisionRow extends QueryResultRow {
   readonly reviewed_at: Date;
 }
 
+function boundedHeartbeatDuration(value: number, name: string, maximum: number): number {
+  if (!Number.isInteger(value) || value <= 0 || value > maximum) {
+    throw new RangeError(`${name} must be an integer between 1 and ${String(maximum)} milliseconds.`);
+  }
+
+  return value;
+}
+
+function boundedOperationSignal(signal?: AbortSignal): AbortSignal {
+  const timeout = AbortSignal.timeout(APPROVAL_OWNED_OPERATION_TIMEOUT_MS);
+
+  return signal === undefined
+    ? timeout
+    : AbortSignal.any([
+        signal,
+        timeout
+      ]);
+}
+
+function throwIfAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted === true) {
+    throw claimAbortReason(signal);
+  }
+}
+
+function claimAbortReason(signal: AbortSignal | undefined): Error {
+  return signal?.reason instanceof Error
+    ? signal.reason
+    : new ApprovalClaimOwnershipError();
+}
+
+function waitForAbort<T>(
+  operation: Promise<T>,
+  signal: AbortSignal,
+  onLateResolve?: (value: T) => void
+): Promise<T> {
+  if (signal.aborted) {
+    void operation.then((value) => {
+      onLateResolve?.(value);
+    }, () => undefined);
+    return Promise.reject(claimAbortReason(signal));
+  }
+
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const cleanup = (): void => {
+      signal.removeEventListener("abort", onAbort);
+    };
+    const onAbort = (): void => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      cleanup();
+      reject(claimAbortReason(signal));
+    };
+
+    signal.addEventListener("abort", onAbort, {
+      once: true
+    });
+    void operation.then((value) => {
+      if (settled) {
+        onLateResolve?.(value);
+        return;
+      }
+      settled = true;
+      cleanup();
+      resolve(value);
+    }, (error: unknown) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      cleanup();
+      reject(error instanceof Error ? error : new Error("Approval owned operation failed."));
+    });
+  });
+}
+
+async function withAbortablePoolClient<T>(
+  pool: Pool,
+  signal: AbortSignal,
+  operation: (client: PoolClient) => Promise<T>
+): Promise<T> {
+  throwIfAborted(signal);
+  const connection = pool.connect();
+  const client = await waitForAbort(connection, signal, (lateClient) => {
+    lateClient.release(true);
+  });
+  const clientState = {
+    released: false
+  };
+  const onAbort = (): void => {
+    if (!clientState.released) {
+      clientState.released = true;
+      client.release(claimAbortReason(signal));
+    }
+  };
+
+  signal.addEventListener("abort", onAbort, {
+    once: true
+  });
+
+  try {
+    throwIfAborted(signal);
+    const result = await operation(client);
+    throwIfAborted(signal);
+    return result;
+  } finally {
+    signal.removeEventListener("abort", onAbort);
+    if (!clientState.released) {
+      clientState.released = true;
+      client.release();
+    }
+  }
+}
+
 async function probePool(pool: Pool, summary: string): Promise<ApprovalDependencyProbe> {
   try {
     await pool.query("SELECT 1");
@@ -1692,6 +2244,7 @@ async function publishCarrierWithConfirm(
     readonly routingKey: string;
     readonly confirmTimeoutMs: number;
     readonly retryJitterMs?: number;
+    readonly signal?: AbortSignal;
   }
 ): Promise<void> {
   const content = Buffer.from(JSON.stringify(options.carrier), "utf8");
@@ -1707,6 +2260,7 @@ async function publishCarrierWithConfirm(
       channel.off("return", onReturn);
       channel.off("close", onClose);
       channel.off("error", onChannelError);
+      options.signal?.removeEventListener("abort", onAbort);
       settled = true;
     };
     const fail = (error: Error): void => {
@@ -1728,6 +2282,12 @@ async function publishCarrierWithConfirm(
     const onChannelError = (): void => {
       fail(new Error("RabbitMQ channel errored during publish."));
     };
+    const onAbort = (): void => {
+      fail(claimAbortReason(options.signal));
+      void channel.close().catch(() => undefined);
+    };
+
+    throwIfAborted(options.signal);
 
     timeout = setTimeout(() => {
       fail(new Error("RabbitMQ publish confirm timed out."));
@@ -1736,6 +2296,10 @@ async function publishCarrierWithConfirm(
     channel.on("return", onReturn);
     channel.on("close", onClose);
     channel.on("error", onChannelError);
+    options.signal?.addEventListener("abort", onAbort, {
+      once: true
+    });
+    throwIfAborted(options.signal);
     channel.publish(
       options.exchange,
       options.routingKey,

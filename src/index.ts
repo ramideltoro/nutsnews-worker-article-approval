@@ -41,6 +41,8 @@ export {
 } from "./config.js";
 export type {
   ApprovalBrokerOutbox,
+  ApprovalBrokerTransport,
+  ApprovalClaimOwnership,
   ApprovalDatabaseTransaction,
   ApprovalDatabaseTransactionRunner,
   ApprovalDependencies,
@@ -60,6 +62,7 @@ export type {
   ApprovalWorkTools
 } from "./dependencies.js";
 export {
+  ApprovalClaimOwnershipError,
   ApprovalQwenError
 } from "./dependencies.js";
 export {
@@ -133,16 +136,18 @@ export function createApprovalApplication(
   config = loadApprovalConfig(),
   options: ApprovalApplicationOptions = {}
 ): ApprovalApplication {
+  const adapterMode = options.dependencies?.adapterMode
+    ?? (config.dependencyMode === "production" ? "production" : "in_memory");
   const identity = {
     service: config.serviceName,
     version: config.serviceVersion,
     environment: config.environment,
     host: config.host,
     revision: config.buildRevision,
-    deployment: config.dependencyMode === "production"
+    deployment: config.environment === "production"
       ? "shadow"
       : config.environment === "test" ? "test" : "local",
-    adapter: config.dependencyMode === "production" ? "production" : "in_memory"
+    adapter: adapterMode
   } as const;
   const logSink = config.telemetryLogs === "stdout"
     ? createJsonRuntimeTelemetrySink({
@@ -154,7 +159,8 @@ export function createApprovalApplication(
     : undefined;
   const metrics = config.metricsEnabled
     ? createApprovalPrometheusTelemetrySink({
-        identity
+        identity,
+        expectedActive: false
       })
     : undefined;
   const telemetry = combineBestEffortTelemetrySinks(logSink, metrics);
@@ -170,16 +176,19 @@ export function createApprovalApplication(
     : createLocalApprovalDependencies({
         clock: SYSTEM_RUNTIME_CLOCK
       }));
-  const dependencies = options.dependencies ?? {
-    ...baseDependencies,
-    workHandler: createArticleApprovalWorkHandler({
-      config,
-      dependencies: baseDependencies,
-      ...(telemetry === undefined ? {} : {
-        telemetry
-      })
-    })
-  };
+  const dependencies = options.dependencies
+    ?? (config.dependencyMode === "production"
+      ? baseDependencies
+      : {
+          ...baseDependencies,
+          workHandler: createArticleApprovalWorkHandler({
+            config,
+            dependencies: baseDependencies,
+            ...(telemetry === undefined ? {} : {
+              telemetry
+            })
+          })
+        });
   const service = createApprovalService({
     config,
     dependencies,
@@ -229,16 +238,30 @@ export function createApprovalApplication(
     dependenciesClosed = true;
     await baseDependencies.close();
   };
+  const shutdownResources = async (): Promise<void> => {
+    stopRequested = true;
+    let firstFailure: Error | undefined;
+    const attempt = async (operation: () => Promise<void>): Promise<void> => {
+      try {
+        await operation();
+      } catch (error: unknown) {
+        firstFailure ??= error instanceof Error
+          ? error
+          : new Error("Approval application shutdown failed.");
+      }
+    };
+
+    await attempt(closeListener);
+    await attempt(() => service.stop());
+    await attempt(closeDependencies);
+
+    if (firstFailure !== undefined) {
+      throw firstFailure;
+    }
+  };
   const shutdown = createRuntimeShutdownController({
     callbacks: [
-      async () => {
-        stopRequested = true;
-        await closeListener();
-      },
-      async () => {
-        await service.stop();
-      },
-      closeDependencies
+      shutdownResources
     ],
     signalSource: process,
     timeoutMs: config.shutdownTimeoutMs,

@@ -528,6 +528,16 @@ class FakePool {
     return this as never;
   }
 
+  connect(): Promise<{
+    readonly query: FakePool["query"];
+    readonly release: () => void;
+  }> {
+    return Promise.resolve({
+      query: this.query.bind(this),
+      release: () => undefined
+    });
+  }
+
   query(sql: string, values: readonly unknown[] = []): Promise<{ readonly rows: QueryResultRow[]; readonly rowCount: number }> {
     this.queries.push({
       sql,

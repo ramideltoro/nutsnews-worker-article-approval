@@ -28,7 +28,7 @@ describe("approval immutable telemetry identity", () => {
 
     expect(identitySamples).toHaveLength(2);
     expect(expectedActiveSamples).toEqual([
-      'nutsnews_worker_expected_active{environment="production",service="approval"} 0'
+      'nutsnews_worker_expected_active{environment="production",service="nutsnews-worker-article-approval"} 0'
     ]);
     expect(identitySamples.join("\n")).toContain(`revision="${BUILD_REVISION}"`);
     expect(identitySamples.join("\n")).toContain('deployment="shadow"');

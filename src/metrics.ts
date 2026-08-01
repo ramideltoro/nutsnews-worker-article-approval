@@ -7,7 +7,9 @@ import {
 } from "@ramideltoro/nutsnews-worker-runtime";
 
 export const APPROVAL_STAGE_LATENCY_BUCKETS_SECONDS = [
+  0.005,
   0.01,
+  0.025,
   0.05,
   0.1,
   0.25,
@@ -49,6 +51,26 @@ export interface ApprovalPrometheusTelemetrySink extends ApprovalRuntimeMetricsS
 
 const APPROVAL_STAGE_SERVICE = "approval";
 const APPROVAL_MAIN_QUEUE = "nutsnews.worker.approval.v1";
+const APPROVAL_RUNTIME_DEPENDENCIES = [
+  "approval-shell",
+  "article-approval",
+  "article-approval-work-handler",
+  "local-approval-work-handler"
+] as const;
+const APPROVAL_RUNTIME_HEALTH_CHECKS = [
+  "process",
+  "service-started",
+  "production-dependency-mode",
+  "dependency-adapter-mode",
+  "broker-lifecycle",
+  "rabbitmq-consumer",
+  "approval-state",
+  "database-transactions",
+  "broker-outbox",
+  "qwen-client",
+  "prompt-registry",
+  "shadow-mode"
+] as const;
 const APPROVAL_STAGE_OUTCOMES = [
   "success",
   "duplicate",
@@ -72,7 +94,20 @@ const MAX_LABEL_LENGTH = 96;
 export function createApprovalPrometheusTelemetrySink(
   options: ApprovalPrometheusTelemetrySinkOptions
 ): ApprovalPrometheusTelemetrySink {
-  const runtime = createPrometheusRuntimeTelemetrySink(options);
+  const runtime = createPrometheusRuntimeTelemetrySink({
+    ...options,
+    cardinality: {
+      dependencies: mergeCardinalityAllowlist(
+        APPROVAL_RUNTIME_DEPENDENCIES,
+        options.cardinality?.dependencies
+      ),
+      healthChecks: mergeCardinalityAllowlist(
+        APPROVAL_RUNTIME_HEALTH_CHECKS,
+        options.cardinality?.healthChecks
+      )
+    },
+    expectedActive: options.expectedActive ?? false
+  });
   const environment = metricLabelValue(options.identity.environment);
   const counters = new Map<ApprovalStageOutcome, number>(
     APPROVAL_STAGE_OUTCOMES.map((outcome) => [
@@ -97,12 +132,21 @@ export function createApprovalPrometheusTelemetrySink(
   ]);
   let latencyCount = 0;
   let latencySum = 0;
+  let lastSuccessTimestampSeconds: number | undefined;
 
   return {
     allowedLabels: runtime.allowedLabels,
     async emit(event: RuntimeTelemetryEvent): Promise<void> {
       if (shouldForwardToRuntime(event)) {
         await runtime.emit(event);
+      }
+      const successTimestampSeconds = successfulEventTimestampSeconds(event);
+
+      if (successTimestampSeconds !== undefined
+        && (lastSuccessTimestampSeconds === undefined
+          || successTimestampSeconds > lastSuccessTimestampSeconds)) {
+        lastSuccessTimestampSeconds = successTimestampSeconds;
+        runtime.setLastSuccessTimestamp(lastSuccessTimestampSeconds);
       }
       recordHealthEvent(health, event);
       recordConsumerReadinessEvent(health, event);
@@ -129,16 +173,17 @@ export function createApprovalPrometheusTelemetrySink(
       }
     },
     collect(): string {
-      const runtimeOutput = runtime.collect().trimEnd();
+      const runtimeOutput = withoutMetricFamily(
+        runtime.collect().trimEnd(),
+        "nutsnews_worker_health_probe"
+      );
       const identityOutput = collectCompatibilityIdentityMetrics(options, runtimeOutput);
       const approvalOutput = collectApprovalStageMetrics(environment, counters, bucketCounts, latencyCount, latencySum);
-      const ownershipOutput = collectExpectedActiveMetric(environment);
       const healthOutput = collectHealthProbeMetrics(environment, health);
 
       return `${[
         runtimeOutput,
         identityOutput,
-        ownershipOutput,
         healthOutput,
         approvalOutput
       ].filter((output) => output.length > 0).join("\n")}\n`;
@@ -199,11 +244,18 @@ function hasMetricFamily(output: string, metric: string): boolean {
     || line.startsWith(`${metric} `));
 }
 
-function shouldForwardToRuntime(event: RuntimeTelemetryEvent): boolean {
-  if (event.name === "runtime.health.evaluated") {
-    return false;
-  }
+function withoutMetricFamily(output: string, metric: string): string {
+  return output
+    .split("\n")
+    .filter((line) => !line.startsWith(`# HELP ${metric} `)
+      && !line.startsWith(`# TYPE ${metric} `)
+      && !line.startsWith(`${metric}{`)
+      && !line.startsWith(`${metric} `))
+    .join("\n")
+    .trimEnd();
+}
 
+function shouldForwardToRuntime(event: RuntimeTelemetryEvent): boolean {
   if (event.name !== "runtime.dependency.observed") {
     return true;
   }
@@ -240,17 +292,6 @@ function recordConsumerReadinessEvent(
     && event.outcome !== "active") {
     health.set("readiness", "unhealthy");
   }
-}
-
-function collectExpectedActiveMetric(environment: string): string {
-  return [
-    "# HELP nutsnews_worker_expected_active Whether this worker deployment is expected to own active production work.",
-    "# TYPE nutsnews_worker_expected_active gauge",
-    `nutsnews_worker_expected_active${labels({
-      environment,
-      service: APPROVAL_STAGE_SERVICE
-    })} 0`
-  ].join("\n");
 }
 
 function collectHealthProbeMetrics(
@@ -387,6 +428,29 @@ function formatMetricNumber(value: number): string {
 
 function durationSecondsFrom(value: number | undefined): number | undefined {
   return value !== undefined && Number.isFinite(value) ? Math.max(0, value) / 1_000 : undefined;
+}
+
+function successfulEventTimestampSeconds(event: RuntimeTelemetryEvent): number | undefined {
+  if (event.stage !== "approval"
+    || (event.name !== "runtime.message.accepted" && event.name !== "runtime.message.duplicate")) {
+    return undefined;
+  }
+
+  const timestampMilliseconds = Date.parse(event.at);
+
+  return Number.isFinite(timestampMilliseconds)
+    ? Math.max(0, Math.floor(timestampMilliseconds / 1_000))
+    : undefined;
+}
+
+function mergeCardinalityAllowlist(
+  required: readonly string[],
+  additional: readonly string[] | undefined
+): readonly string[] {
+  return Array.from(new Set([
+    ...required,
+    ...(additional ?? [])
+  ]));
 }
 
 function isHealthProbe(value: unknown): value is ApprovalHealthProbe {

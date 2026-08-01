@@ -85,6 +85,25 @@ describe("loadApprovalConfig", () => {
     }
   });
 
+  it("requires production dependencies for a normalized production environment", () => {
+    expect(() => loadApprovalConfig({
+      NUTSNEWS_ENVIRONMENT: " Production ",
+      NUTSNEWS_APPROVAL_DEPENDENCY_MODE: "test"
+    })).toThrow(ApprovalConfigError);
+
+    try {
+      loadApprovalConfig({
+        NUTSNEWS_ENVIRONMENT: " Production ",
+        NUTSNEWS_APPROVAL_DEPENDENCY_MODE: "test"
+      });
+    } catch (error: unknown) {
+      expect(error).toBeInstanceOf(ApprovalConfigError);
+      expect((error as ApprovalConfigError).issues).toContain(
+        "NUTSNEWS_APPROVAL_DEPENDENCY_MODE must be production when NUTSNEWS_ENVIRONMENT=production."
+      );
+    }
+  });
+
   it("rejects unsafe concurrency bounds and shadow cutover in this repo", () => {
     expect(() => loadApprovalConfig({
       NUTSNEWS_APPROVAL_CONCURRENCY: "8",
@@ -154,6 +173,7 @@ describe("loadApprovalConfig", () => {
 
   it("accepts explicit production dependency presence without retaining sensitive values", () => {
     const config = loadApprovalConfig({
+      NUTSNEWS_ENVIRONMENT: "PRODUCTION",
       NUTSNEWS_APPROVAL_DEPENDENCY_MODE: "production",
       NUTSNEWS_APPROVAL_BUILD_REVISION: "0123456789abcdef0123456789abcdef01234567",
       NUTSNEWS_APPROVAL_DATABASE_URL: "postgres://example.invalid/worker",
@@ -169,6 +189,7 @@ describe("loadApprovalConfig", () => {
       qwenEndpointConfigured: true,
       qwenCredentialConfigured: true
     });
+    expect(config.environment).toBe("production");
     expect(config.buildRevision).toBe("0123456789abcdef0123456789abcdef01234567");
     expect(JSON.stringify(config)).not.toContain("postgres://example.invalid");
     expect(JSON.stringify(config)).not.toContain("amqp://example.invalid");

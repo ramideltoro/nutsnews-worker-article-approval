@@ -20,11 +20,12 @@ This service uses a versioned editorial prompt with the configured Qwen-compatib
 - Publishes contracted `translationTask` messages only when the stored decision is accepted and has not already been published downstream.
 - Keeps legacy OpenAI fallback disabled unless an explicit protected flag, nonzero budget, provenance marker, and alert topic are all configured.
 - Uses shared runtime broker lifecycle, in-flight drain, idempotency store, retry/DLQ destinations, health reports, and Prometheus metrics.
-- Gives each production PostgreSQL idempotency claim a database-timed 300-second lease. Completion, failure, and release require the matching token while the lease age is strictly below 300 seconds; at the exact boundary those owner mutations fail and reclaim becomes eligible. Reclaim atomically compares status, token, and stored acquisition timestamp, issues a fresh token, and cannot downgrade completed or concurrently replaced work.
-- Emits exactly one completing lifecycle event for each delivery (`accepted`, `duplicate`, `invalid`, `retry`, or `dlq`) with message identifiers retained only as structured log metadata and bounded shared labels used for Prometheus series. The metrics endpoint also exposes `nutsnews_worker_uplift_stage_events_total`, seeding the shared six-outcome contract (`success`, `duplicate`, `invalid`, `retry`, `dlq`, and `failure`) even when an outcome remains zero, a fixed-bucket `nutsnews_worker_uplift_stage_latency_seconds` histogram including the 30-second SLO boundary, and `nutsnews_worker_expected_active=0` while this deployment remains shadow-only.
+- Gives each production PostgreSQL idempotency claim a database-timed 300-second lease. A store-owned, single-flight heartbeat renews it at most every 60 seconds through a dedicated, bounded PostgreSQL connection and refreshes time from `clock_timestamp()`. Renewal miss, error, timeout, dependency close, and over-deadline shutdown abort the local ownership signal; database, Qwen, and broker operations consume that signal and use a 45-second maximum operation window. Completion requires the matching live local claim plus a token-and-unexpired-lease compare-and-set. Failure and release use the same compare-and-set as fail-closed cleanup. At the exact boundary owner mutations fail and reclaim becomes eligible; reclaim atomically compares status, token, and stored acquisition timestamp, issues a fresh token, and cannot downgrade completed or concurrently replaced work.
+- Emits exactly one completing lifecycle event for each delivery (`accepted`, `duplicate`, `invalid`, `retry`, or `dlq`) with message identifiers retained only as structured log metadata and bounded shared labels used for Prometheus series. The metrics endpoint also exposes `nutsnews_worker_uplift_stage_events_total`, seeding the shared six-outcome contract (`success`, `duplicate`, `invalid`, `retry`, `dlq`, and `failure`) even when an outcome remains zero, a fixed-bucket `nutsnews_worker_uplift_stage_latency_seconds` histogram with the Runtime 1 boundaries from 5 milliseconds through 300 seconds, and Runtime-owned `nutsnews_worker_expected_active=0` while this deployment remains shadow-only. Accepted and duplicate completions advance the Runtime last-success timestamp monotonically.
 - Uses Runtime 1.0 fixed-bucket processing and dependency histograms in seconds alongside the canonical stage histogram. Duration-less dependency events remain available as structured logs without fabricating zero-duration samples.
-- Exposes one-hot `liveness`, `startup`, and `readiness` compatibility gauges from conservative pre-start defaults, and treats all log/metric emission failures as best-effort so observability cannot change delivery state.
+- Exposes one local, one-hot `liveness`, `startup`, and `readiness` gauge family from conservative pre-start defaults while forwarding health events to Runtime 1 for bounded per-check status and duration families. A `/metrics` scrape freshly evaluates all probes, including readiness, before collection.
 - Keeps liveness independent from Qwen readiness; `/live` only checks process health, while `/ready` gates an active `approval` main-queue consumer, broker, state, outbox, Qwen, prompt registry, and shadow mode.
+- Refuses startup before broker connection or consumer registration when a production environment is paired with test dependency mode, or when production dependency mode is paired with non-production adapters. Telemetry reports the adapter mode supplied by the actual dependency composition.
 - Emits bounded structured events and Prometheus metrics when RabbitMQ cancels the consumer, drops its channel, or restores consumption.
 
 ## Configuration
@@ -33,6 +34,8 @@ The HTTP server exposes `/config-schema` with names, defaults, sensitivity, and 
 
 | Variable | Default | Production | Sensitive |
 | --- | --- | --- | --- |
+| `NUTSNEWS_ENVIRONMENT` | `local` | must be `production` for production deployment | no |
+| `NUTSNEWS_APPROVAL_DEPENDENCY_MODE` | `test` | must be `production` when the environment is production | no |
 | `NUTSNEWS_APPROVAL_BUILD_REVISION` | `development` | required lowercase 40-character Git SHA | no |
 | `NUTSNEWS_APPROVAL_DATABASE_URL` | unset | required | yes |
 | `NUTSNEWS_APPROVAL_RABBITMQ_URL` | unset | required | yes |
@@ -84,6 +87,8 @@ This repository owns its package or service implementation, CI, package or image
 `ramideltoro/nutsnews-backend` owns backend-host runtime and deployments. `production-backend` in that repository remains the runtime secret and deployment boundary. No production secret belongs in this repository.
 
 `ramideltoro/nutsnews-infra` owns Grafana Cloud resources. `ramideltoro/nutsnews-docs` owns explanatory architecture and operations documentation.
+
+This worker remains deliberately shadow-only: configuration rejects `NUTSNEWS_APPROVAL_SHADOW_MODE=false`, deployment identity remains `shadow`, and Runtime exports `nutsnews_worker_expected_active=0`. The lease heartbeat makes the current shadow observability rollout fail closed, but it is not a production-ownership cutover gate. Production ownership still requires server-fenced business mutations and a transactional outbox that durably records publish intent before RabbitMQ publication, eliminating the current publish/outbox ambiguity.
 
 ## Package / Image Access
 

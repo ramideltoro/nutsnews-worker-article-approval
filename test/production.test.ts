@@ -38,6 +38,8 @@ describe("production approval dependencies", () => {
     expect(dependencies.brokerOutbox.name).toBe("postgres-approval-outbox");
     expect(dependencies.qwenClient.name).toBe("local-ai-approval-client");
     expect(dependencies.promptRegistry.name).toBe("static-approval-prompt-registry");
+    expect(dependencies.adapterMode).toBe("production");
+    expect(dependencies.workHandler.name).toBe("article-approval-work-handler");
 
     await dependencies.close();
   });
