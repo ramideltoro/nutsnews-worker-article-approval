@@ -3,16 +3,17 @@ import {
   STAGE_PAYLOAD_SCHEMA_VERSION
 } from "@ramideltoro/nutsnews-worker-contracts";
 import {
-  createBufferedRuntimeTelemetrySink,
-  createPrometheusRuntimeTelemetrySink
+  createBufferedRuntimeTelemetrySink
 } from "@ramideltoro/nutsnews-worker-runtime";
 import {
   describe,
   expect,
-  it
+  it,
+  vi
 } from "vitest";
 
 import { loadApprovalConfig } from "../src/config.js";
+import { createApprovalPrometheusTelemetrySink } from "../src/metrics.js";
 import { createApprovalService } from "../src/service.js";
 import {
   InMemoryApprovalStateStore,
@@ -23,6 +24,7 @@ import {
   LocalApprovalWorkHandler,
   LocalBrokerTransport,
   createLocalApprovalDependencies,
+  createMinimalApprovalEnvelope,
   createMinimalApprovalDelivery
 } from "../src/test-doubles.js";
 
@@ -41,7 +43,7 @@ describe("createApprovalService", () => {
     expect((await context.service.health.liveness()).status).toBe("ok");
     expect((await context.service.health.startup()).status).toBe("ok");
     expect((await context.service.health.readiness()).status).toBe("ok");
-    expect(context.metrics.collect()).toContain("nutsnews_worker_dependency_duration_ms");
+    expect(context.metrics.collect()).not.toContain("nutsnews_worker_dependency_duration_ms");
 
     await context.service.stop();
 
@@ -125,6 +127,46 @@ describe("createApprovalService", () => {
     expect(context.service.isStarted).toBe(false);
   });
 
+  it("aborts an over-deadline delivery, closes the broker, and reports the drain timeout", async () => {
+    vi.useFakeTimers();
+
+    try {
+      const context = createServiceContext({
+        NUTSNEWS_APPROVAL_SHUTDOWN_TIMEOUT_MS: "1000"
+      });
+      const gate = deferred<undefined>();
+      const started = deferred<undefined>();
+
+      context.workHandler.handleGate = gate.promise;
+      context.workHandler.onHandleStart = () => {
+        started.resolve(undefined);
+      };
+
+      await context.service.start();
+      const delivery = context.broker.deliverApproval();
+      await started.promise;
+      const stopping = context.service.stop();
+      const stopped = expect(stopping).rejects.toThrow("Shutdown exceeded 1000ms");
+
+      expect(context.service.isDraining).toBe(true);
+      await vi.advanceTimersByTimeAsync(1_000);
+
+      await expect(delivery).resolves.toMatchObject({
+        action: "retry",
+        reason: "handler-error"
+      });
+      await stopped;
+      expect(context.workHandler.handled).toHaveLength(0);
+      expect(context.service.isStarted).toBe(false);
+      expect(context.service.broker.state).toBe("closed");
+      expect(() => context.stateStore.ownership(createMinimalApprovalEnvelope().idempotencyKey)).toThrow();
+
+      gate.resolve(undefined);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("keeps liveness independent from AI endpoint readiness", async () => {
     const context = createServiceContext();
 
@@ -153,16 +195,111 @@ describe("createApprovalService", () => {
 
     await context.service.stop();
   });
+
+  it("fails readiness for defensively injected production config using test dependencies", async () => {
+    const localConfig = loadApprovalConfig({
+      NUTSNEWS_APPROVAL_TELEMETRY_LOGS: "silent"
+    });
+    const config = {
+      ...localConfig,
+      environment: "production"
+    } as const;
+    const dependencies = createLocalApprovalDependencies();
+    const service = createApprovalService({
+      config,
+      dependencies
+    });
+
+    await expect(service.start()).rejects.toThrow(
+      "Approval startup refused: production environment requires production dependency mode."
+    );
+    const readiness = await service.health.readiness();
+
+    expect(readiness.status).toBe("unhealthy");
+    expect(readiness.checks.find((check) => check.name === "production-dependency-mode")).toMatchObject({
+      status: "unhealthy",
+      details: {
+        environment: "production",
+        dependencyMode: "test"
+      }
+    });
+
+    expect((dependencies.brokerTransport as LocalBrokerTransport).assertedRoutes).toHaveLength(0);
+  });
+
+  it("refuses a defensively injected shadow cutover before broker topology or consumption", async () => {
+    const config = {
+      ...loadApprovalConfig({
+        NUTSNEWS_APPROVAL_TELEMETRY_LOGS: "silent"
+      }),
+      shadowMode: false
+    } as const;
+    const dependencies = createLocalApprovalDependencies();
+    const service = createApprovalService({
+      config,
+      dependencies
+    });
+
+    await expect(service.start()).rejects.toThrow(
+      "Approval startup refused: this worker must remain in shadow mode."
+    );
+    const readiness = await service.health.readiness();
+
+    expect(readiness.status).toBe("unhealthy");
+    expect(readiness.checks.find((check) => check.name === "shadow-mode")).toMatchObject({
+      status: "unhealthy",
+      details: {
+        reason: "shadow-mode-disabled"
+      }
+    });
+    expect((dependencies.brokerTransport as LocalBrokerTransport).assertedRoutes).toHaveLength(0);
+    expect(service.consumer).toBeUndefined();
+  });
+
+  it("fails readiness when production mode receives non-production adapters", async () => {
+    const config = loadApprovalConfig({
+      NUTSNEWS_ENVIRONMENT: "production",
+      NUTSNEWS_APPROVAL_DEPENDENCY_MODE: "production",
+      NUTSNEWS_APPROVAL_BUILD_REVISION: "0123456789abcdef0123456789abcdef01234567",
+      NUTSNEWS_APPROVAL_DATABASE_URL: "postgres://example.invalid/worker",
+      NUTSNEWS_APPROVAL_RABBITMQ_URL: "amqp://example.invalid",
+      NUTSNEWS_APPROVAL_QWEN_BASE_URL: "https://qwen.internal.invalid/v1",
+      NUTSNEWS_APPROVAL_QWEN_API_KEY: "test-key",
+      NUTSNEWS_APPROVAL_TELEMETRY_LOGS: "silent"
+    });
+    const dependencies = createLocalApprovalDependencies();
+    const service = createApprovalService({
+      config,
+      dependencies
+    });
+
+    await expect(service.start()).rejects.toThrow(
+      "Approval startup refused: production dependency mode requires production adapters."
+    );
+    const readiness = await service.health.readiness();
+
+    expect(readiness.status).toBe("unhealthy");
+    expect(readiness.checks.find((check) => check.name === "dependency-adapter-mode")).toMatchObject({
+      status: "unhealthy",
+      details: {
+        dependencyMode: "production",
+        adapterMode: "in_memory"
+      }
+    });
+
+    expect((dependencies.brokerTransport as LocalBrokerTransport).assertedRoutes).toHaveLength(0);
+  });
 });
 
-function createServiceContext() {
+function createServiceContext(env: NodeJS.ProcessEnv = {}) {
   const config = loadApprovalConfig({
     NUTSNEWS_APPROVAL_HTTP_PORT: "0",
-    NUTSNEWS_APPROVAL_TELEMETRY_LOGS: "silent"
+    NUTSNEWS_APPROVAL_TELEMETRY_LOGS: "silent",
+    ...env
   });
   const dependencies = createLocalApprovalDependencies();
   const telemetry = createBufferedRuntimeTelemetrySink();
-  const metrics = createPrometheusRuntimeTelemetrySink({
+  const metrics = createApprovalPrometheusTelemetrySink({
     identity: {
       service: config.serviceName,
       version: config.serviceVersion,

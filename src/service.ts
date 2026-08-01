@@ -1,29 +1,22 @@
 import {
-  getRetryDestination,
-  getWorkerRoute,
-  validateStagePayload,
-  validateWorkerEnvelope,
-  type StagePayloadValidationIssue,
-  type WorkerMessageEnvelope
+  getWorkerRoute
 } from "@ramideltoro/nutsnews-worker-contracts";
 import {
   createBrokerLifecycle,
   createBrokerConsumerReadinessCheck,
   createRuntimeHealthProbeSet,
   createRuntimeInFlightDrainController,
+  createRuntimeMessageProcessor,
   emitRuntimeTelemetry,
   runtimeNow,
   type BrokerConsumerHandle,
   type BrokerLifecycle,
-  type PrometheusRuntimeTelemetrySink,
   type RuntimeHealthCheck,
+  type RuntimeHealthReport,
   type RuntimeHealthProbeSet,
-  type RuntimeIdempotencyStore,
-  type RuntimeMessageContext,
   type RuntimeMessageDelivery,
   type RuntimeMessageProcessingResult,
-  type RuntimeTelemetrySink,
-  type RuntimeValidationIssue
+  type RuntimeTelemetrySink
 } from "@ramideltoro/nutsnews-worker-runtime";
 
 import type { ApprovalConfig } from "./config.js";
@@ -31,12 +24,20 @@ import type {
   ApprovalDependencies,
   ApprovalDependencyProbe
 } from "./dependencies.js";
+import type {
+  ApprovalPrometheusTelemetrySink,
+  ApprovalRuntimeMetricsSink
+} from "./metrics.js";
+import {
+  bestEffortTelemetrySink,
+  runTelemetryBestEffort
+} from "./telemetry.js";
 
 export interface ApprovalServiceOptions {
   readonly config: ApprovalConfig;
   readonly dependencies: ApprovalDependencies;
   readonly telemetry?: RuntimeTelemetrySink;
-  readonly metrics?: PrometheusRuntimeTelemetrySink;
+  readonly metrics?: ApprovalRuntimeMetricsSink;
 }
 
 export interface ApprovalService {
@@ -53,6 +54,7 @@ export interface ApprovalService {
 export function createApprovalService(options: ApprovalServiceOptions): ApprovalService {
   const approvalRoute = getWorkerRoute("approval");
   const translationRoute = getWorkerRoute("translation");
+  const telemetry = bestEffortTelemetrySink(options.telemetry);
   const broker = createBrokerLifecycle({
     transport: options.dependencies.brokerTransport,
     routes: [
@@ -60,29 +62,51 @@ export function createApprovalService(options: ApprovalServiceOptions): Approval
       translationRoute
     ],
     clock: options.dependencies.clock,
-    ...(options.telemetry === undefined ? {} : {
-      telemetry: options.telemetry
+    ...(telemetry === undefined ? {} : {
+      telemetry
     })
   });
   const drain = createRuntimeInFlightDrainController({
     timeoutMs: options.config.shutdownTimeoutMs
   });
-  const processor = createApprovalInputProcessor({
-    dependencies: options.dependencies,
-    ...(options.telemetry === undefined ? {} : {
-      telemetry: options.telemetry
+  const processor = createRuntimeMessageProcessor({
+    stage: "approval",
+    idempotencyStore: options.dependencies.stateStore,
+    clock: options.dependencies.clock,
+    ...(telemetry === undefined ? {} : {
+      telemetry
     }),
     handler: async (context) => {
+      const ownership = options.dependencies.stateStore.ownership(context.envelope.idempotencyKey);
+
       try {
         return await drain.track(async () => {
-          options.metrics?.setInFlight(approvalRoute.mainQueue.name, drain.inFlight);
+          setInFlight(options.metrics, approvalRoute.mainQueue.name, drain.inFlight);
+          ownership.assertOwned();
           const result = await options.dependencies.workHandler.handle(context, {
-            publish: (command) => broker.publish(command),
-            recordOutbox: (command, receipt) => options.dependencies.brokerOutbox.record(command, receipt),
-            withTransaction: (operation) => options.dependencies.transactionRunner.withTransaction(operation)
+            signal: ownership.signal,
+            assertOwnership: () => ownership.assertOwned(),
+            publish: async (command) => {
+              ownership.assertOwned();
+              const receipt = await options.dependencies.brokerTransport.publishOwned(command, ownership.signal);
+              ownership.assertOwned();
+              return receipt;
+            },
+            recordOutbox: async (command, receipt) => {
+              ownership.assertOwned();
+              await options.dependencies.brokerOutbox.record(command, receipt, ownership.signal);
+              ownership.assertOwned();
+            },
+            withTransaction: async (operation) => {
+              ownership.assertOwned();
+              const value = await options.dependencies.transactionRunner.withTransaction(operation, ownership.signal);
+              ownership.assertOwned();
+              return value;
+            }
           });
+          ownership.assertOwned();
 
-          await emitRuntimeTelemetry(options.telemetry, {
+          await emitRuntimeTelemetry(telemetry, {
             name: "runtime.dependency.observed",
             level: result.status === "ok" ? "info" : "warn",
             at: runtimeNow(options.dependencies.clock),
@@ -99,7 +123,7 @@ export function createApprovalService(options: ApprovalServiceOptions): Approval
           return result;
         });
       } finally {
-        options.metrics?.setInFlight(approvalRoute.mainQueue.name, drain.inFlight);
+        setInFlight(options.metrics, approvalRoute.mainQueue.name, drain.inFlight);
       }
     }
   });
@@ -111,7 +135,7 @@ export function createApprovalService(options: ApprovalServiceOptions): Approval
       return broker;
     },
     get health(): RuntimeHealthProbeSet {
-      return createRuntimeHealthProbeSet({
+      const probes = createRuntimeHealthProbeSet({
         livenessChecks: [
           livenessCheck()
         ],
@@ -119,6 +143,8 @@ export function createApprovalService(options: ApprovalServiceOptions): Approval
           startupCheck(() => started)
         ],
         readinessChecks: [
+          productionDependencyModeCheck(options.config),
+          dependencyAdapterModeCheck(options.config, options.dependencies.adapterMode),
           brokerReadinessCheck(broker),
           createBrokerConsumerReadinessCheck(broker, "approval"),
           dependencyReadinessCheck("approval-state", options.dependencies.stateStore),
@@ -129,10 +155,12 @@ export function createApprovalService(options: ApprovalServiceOptions): Approval
           shadowModeCheck(options.config)
         ],
         clock: options.dependencies.clock,
-        ...(options.telemetry === undefined ? {} : {
-          telemetry: options.telemetry
+        ...(telemetry === undefined ? {} : {
+          telemetry
         })
       });
+
+      return observeHealthProbes(probes, options.metrics);
     },
     get isStarted(): boolean {
       return started;
@@ -148,12 +176,24 @@ export function createApprovalService(options: ApprovalServiceOptions): Approval
         return;
       }
 
+      assertSafeDependencyComposition(options.config, options.dependencies.adapterMode);
       await broker.start();
-      consumer = await broker.consume("approval", processor);
+      const brokerConsumer = await broker.consume("approval", processor);
+      consumer = {
+        stage: brokerConsumer.stage,
+        cancel: async () => {
+          await brokerConsumer.cancel();
+          await refreshHealthProbeBestEffort(
+            "readiness",
+            () => service.health.readiness(),
+            options.metrics
+          );
+        }
+      };
       started = true;
-      options.metrics?.recordDependencyLatency(approvalRoute.mainQueue.name, 0, "success");
-      options.metrics?.setInFlight(approvalRoute.mainQueue.name, drain.inFlight);
-      await emitRuntimeTelemetry(options.telemetry, {
+      setHealthProbe(options.metrics, "startup", "ok");
+      setInFlight(options.metrics, approvalRoute.mainQueue.name, drain.inFlight);
+      await emitRuntimeTelemetry(telemetry, {
         name: "runtime.dependency.observed",
         level: "info",
         at: runtimeNow(options.dependencies.clock),
@@ -169,20 +209,45 @@ export function createApprovalService(options: ApprovalServiceOptions): Approval
           shadowMode: options.config.shadowMode
         }
       });
+      await refreshHealthMetricsBestEffort(service.health, options.metrics);
     },
     async stop(): Promise<void> {
       if (!started && broker.state === "closed") {
         return;
       }
 
+      const cancelConsumer = consumer?.cancel();
       drain.stopAcceptingWork();
-      options.metrics?.setShutdownDraining(true);
-      await drain.waitForDrain(options.config.shutdownTimeoutMs);
-      await broker.stop("shutdown");
-      options.metrics?.setShutdownDraining(false);
-      options.metrics?.setInFlight(approvalRoute.mainQueue.name, drain.inFlight);
-      consumer = undefined;
-      started = false;
+      setShutdownDraining(options.metrics, true);
+      let drainFailure: Error | undefined;
+
+      try {
+        await cancelConsumer;
+        try {
+          await drain.waitForDrain(options.config.shutdownTimeoutMs);
+        } catch (error: unknown) {
+          drainFailure = error instanceof Error
+            ? error
+            : new Error("Approval service failed while draining in-flight work.");
+          await options.dependencies.stateStore.abortActiveClaims(
+            "Approval service shutdown exceeded the in-flight drain deadline."
+          );
+        }
+
+        await broker.stop("shutdown");
+      } finally {
+        setShutdownDraining(options.metrics, false);
+        setInFlight(options.metrics, approvalRoute.mainQueue.name, drain.inFlight);
+        setHealthProbe(options.metrics, "startup", "unhealthy");
+        setHealthProbe(options.metrics, "readiness", "unhealthy");
+        consumer = undefined;
+        started = false;
+        await refreshHealthMetricsBestEffort(service.health, options.metrics);
+      }
+
+      if (drainFailure !== undefined) {
+        throw drainFailure;
+      }
     },
     processDelivery(delivery: RuntimeMessageDelivery): Promise<RuntimeMessageProcessingResult> {
       return processor(delivery);
@@ -192,112 +257,81 @@ export function createApprovalService(options: ApprovalServiceOptions): Approval
   return service;
 }
 
-interface ApprovalInputProcessorOptions {
-  readonly dependencies: ApprovalDependencies;
-  readonly telemetry?: RuntimeTelemetrySink;
-  handler(context: RuntimeMessageContext): Promise<{ readonly status: "ok" } | { readonly status: "retry"; readonly reason: string; readonly retryAfterMs?: number } | { readonly status: "terminal-failure"; readonly reason: string }>;
+function setHealthProbe(
+  metrics: ApprovalRuntimeMetricsSink | undefined,
+  probe: "liveness" | "startup" | "readiness",
+  outcome: "ok" | "degraded" | "unhealthy"
+): void {
+  if (isApprovalMetrics(metrics)) {
+    runTelemetryBestEffort(() => metrics.setHealthProbe(probe, outcome));
+  }
 }
 
-function createApprovalInputProcessor(options: ApprovalInputProcessorOptions) {
-  return async (delivery: RuntimeMessageDelivery): Promise<RuntimeMessageProcessingResult> => {
-    const receivedAt = delivery.receivedAt ?? runtimeNow(options.dependencies.clock);
-    const queue = getWorkerRoute("approval").mainQueue.name;
-    await emitRuntimeTelemetry(options.telemetry, {
-      name: "runtime.message.started",
-      level: "info",
-      at: runtimeNow(options.dependencies.clock),
-      stage: "approval",
-      queue,
-      outcome: "started"
-    });
+function setInFlight(
+  metrics: ApprovalRuntimeMetricsSink | undefined,
+  queue: string,
+  value: number
+): void {
+  runTelemetryBestEffort(() => metrics?.setInFlight(queue, value));
+}
 
-    const envelopeResult = validateWorkerEnvelope(delivery.envelope);
+function setShutdownDraining(
+  metrics: ApprovalRuntimeMetricsSink | undefined,
+  draining: boolean
+): void {
+  runTelemetryBestEffort(() => metrics?.setShutdownDraining(draining));
+}
 
-    if (!envelopeResult.ok) {
-      return {
-        action: "dlq",
-        reason: "invalid-envelope",
-        issues: envelopeResult.issues.map(toRuntimeValidationIssue)
-      };
-    }
+function observeHealthProbes(
+  probes: RuntimeHealthProbeSet,
+  metrics: ApprovalRuntimeMetricsSink | undefined
+): RuntimeHealthProbeSet {
+  const observe = async <T extends RuntimeHealthReport>(
+    probe: "liveness" | "startup" | "readiness",
+    operation: () => Promise<T>
+  ): Promise<T> => {
+    const report = await operation();
+    setHealthProbe(metrics, probe, report.status);
 
-    const envelope = envelopeResult.value;
-
-    if (envelope.route !== "approval") {
-      return terminalResult(envelope, "stage-mismatch", [
-        {
-          path: "$.route",
-          code: "stage-mismatch",
-          message: `Envelope route ${envelope.route} does not match processor stage approval.`
-        }
-      ]);
-    }
-
-    const payloadResult = validateStagePayload(delivery.payload);
-
-    if (!payloadResult.ok) {
-      return terminalResult(envelope, "invalid-payload", payloadResult.issues.map(toRuntimeValidationIssue));
-    }
-
-    if (payloadResult.definition.consumer !== "approval") {
-      return terminalResult(envelope, "payload-consumer-mismatch", [
-        {
-          path: "$.schemaId",
-          code: "payload-consumer-mismatch",
-          message: `Payload schema consumer ${payloadResult.definition.consumer} does not match approval.`
-        }
-      ]);
-    }
-
-    const claim = await options.dependencies.stateStore.claim(envelope.idempotencyKey, {
-      envelope,
-      stage: "approval",
-      receivedAt
-    });
-
-    if (claim.status === "already-completed") {
-      return {
-        action: "ack",
-        reason: "duplicate",
-        envelope
-      };
-    }
-
-    if (claim.status === "in-progress") {
-      return retryOrDlq(envelope, "idempotency-in-progress", 1_000);
-    }
-
-    const context: RuntimeMessageContext = {
-      envelope,
-      payload: payloadResult.value,
-      stage: "approval",
-      receivedAt
-    };
-
-    try {
-      const result = await options.handler(context);
-
-      if (result.status === "ok") {
-        await markCompleted(options.dependencies.stateStore, envelope, options.dependencies.clock);
-        return {
-          action: "ack",
-          reason: "handled",
-          envelope
-        };
-      }
-
-      if (result.status === "retry") {
-        await markFailed(options.dependencies.stateStore, envelope, result.reason, true, options.dependencies.clock);
-        return retryOrDlq(envelope, result.reason, result.retryAfterMs);
-      }
-
-      await markFailed(options.dependencies.stateStore, envelope, result.reason, false, options.dependencies.clock);
-      return terminalResult(envelope, result.reason);
-    } catch (error: unknown) {
-      await markFailed(options.dependencies.stateStore, envelope, classifyHandlerError(error), true, options.dependencies.clock);
-      return retryOrDlq(envelope, "handler-error");
-    }
+    return report;
   };
+
+  return {
+    liveness: () => observe("liveness", () => probes.liveness()),
+    startup: () => observe("startup", () => probes.startup()),
+    readiness: () => observe("readiness", () => probes.readiness())
+  };
+}
+
+async function refreshHealthMetricsBestEffort(
+  probes: RuntimeHealthProbeSet,
+  metrics: ApprovalRuntimeMetricsSink | undefined
+): Promise<void> {
+  await Promise.all([
+    refreshHealthProbeBestEffort("liveness", () => probes.liveness(), metrics),
+    refreshHealthProbeBestEffort("startup", () => probes.startup(), metrics),
+    refreshHealthProbeBestEffort("readiness", () => probes.readiness(), metrics)
+  ]);
+}
+
+async function refreshHealthProbeBestEffort(
+  probe: "liveness" | "startup" | "readiness",
+  operation: () => Promise<RuntimeHealthReport>,
+  metrics: ApprovalRuntimeMetricsSink | undefined
+): Promise<void> {
+  try {
+    await operation();
+  } catch {
+    setHealthProbe(metrics, probe, "unhealthy");
+  }
+}
+
+function isApprovalMetrics(
+  metrics: ApprovalRuntimeMetricsSink | undefined
+): metrics is ApprovalPrometheusTelemetrySink {
+  return metrics !== undefined
+    && "setHealthProbe" in metrics
+    && typeof metrics.setHealthProbe === "function";
 }
 
 function livenessCheck(): RuntimeHealthCheck {
@@ -314,6 +348,68 @@ function startupCheck(isStarted: () => boolean): RuntimeHealthCheck {
     critical: true,
     check: () => isStarted() ? "ok" : "unhealthy"
   };
+}
+
+function productionDependencyModeCheck(config: ApprovalConfig): RuntimeHealthCheck {
+  return {
+    name: "production-dependency-mode",
+    critical: true,
+    check: () => normalizedMode(config.environment) !== "production"
+      || normalizedMode(config.dependencyMode) === "production"
+      ? "ok"
+      : {
+          status: "unhealthy",
+          details: {
+            environment: config.environment,
+            dependencyMode: config.dependencyMode
+          }
+        }
+  };
+}
+
+function dependencyAdapterModeCheck(
+  config: ApprovalConfig,
+  adapterMode: ApprovalDependencies["adapterMode"]
+): RuntimeHealthCheck {
+  return {
+    name: "dependency-adapter-mode",
+    critical: true,
+    check: () => normalizedMode(config.dependencyMode) !== "production"
+      || normalizedMode(adapterMode) === "production"
+      ? "ok"
+      : {
+          status: "unhealthy",
+          details: {
+            dependencyMode: config.dependencyMode,
+            adapterMode
+          }
+        }
+  };
+}
+
+function assertSafeDependencyComposition(
+  config: ApprovalConfig,
+  adapterMode: ApprovalDependencies["adapterMode"]
+): void {
+  const environment = normalizedMode(config.environment);
+  const dependencyMode = normalizedMode(config.dependencyMode);
+  const actualAdapterMode = normalizedMode(adapterMode);
+
+  if (!config.shadowMode) {
+    throw new Error("Approval startup refused: this worker must remain in shadow mode.");
+  }
+
+  if (environment === "production" && dependencyMode !== "production") {
+    throw new Error("Approval startup refused: production environment requires production dependency mode.");
+  }
+
+  if (dependencyMode === "production" && actualAdapterMode !== "production") {
+    throw new Error("Approval startup refused: production dependency mode requires production adapters.");
+  }
+}
+
+function normalizedMode(value: string): string {
+  return value.trim().toLowerCase();
 }
 
 function brokerReadinessCheck(broker: BrokerLifecycle): RuntimeHealthCheck {
@@ -373,107 +469,4 @@ function shadowModeCheck(config: ApprovalConfig): RuntimeHealthCheck {
           }
         }
   };
-}
-
-function retryOrDlq(
-  envelope: WorkerMessageEnvelope,
-  reason: string,
-  retryAfterMs?: number
-): RuntimeMessageProcessingResult {
-  const destination = getRetryDestination(envelope.route, envelope.attempt.count);
-
-  if ("ttlMs" in destination) {
-    if (retryAfterMs === undefined) {
-      return {
-        action: "retry",
-        reason,
-        envelope,
-        destination
-      };
-    }
-
-    return {
-      action: "retry",
-      reason,
-      envelope,
-      destination,
-      retryAfterMs
-    };
-  }
-
-  return {
-    action: "dlq",
-    reason,
-    envelope,
-    destination
-  };
-}
-
-function terminalResult(
-  envelope: WorkerMessageEnvelope,
-  reason: string,
-  issues?: readonly RuntimeValidationIssue[]
-): RuntimeMessageProcessingResult {
-  const destination = getRetryDestination(envelope.route, envelope.attempt.max);
-
-  if (issues === undefined) {
-    return {
-      action: "dlq",
-      reason,
-      envelope,
-      destination
-    };
-  }
-
-  return {
-    action: "dlq",
-    reason,
-    envelope,
-    destination,
-    issues
-  };
-}
-
-function toRuntimeValidationIssue(issue: StagePayloadValidationIssue | RuntimeValidationIssue): RuntimeValidationIssue {
-  return {
-    path: issue.path,
-    code: issue.code,
-    message: issue.message
-  };
-}
-
-async function markCompleted(
-  store: RuntimeIdempotencyStore,
-  envelope: WorkerMessageEnvelope,
-  clock: ApprovalDependencies["clock"]
-): Promise<void> {
-  await store.markCompleted(envelope.idempotencyKey, {
-    completedAt: runtimeNow(clock),
-    messageId: envelope.messageId,
-    stage: "approval"
-  });
-}
-
-async function markFailed(
-  store: RuntimeIdempotencyStore,
-  envelope: WorkerMessageEnvelope,
-  reason: string,
-  retryable: boolean,
-  clock: ApprovalDependencies["clock"]
-): Promise<void> {
-  await store.markFailed(envelope.idempotencyKey, {
-    failedAt: runtimeNow(clock),
-    messageId: envelope.messageId,
-    stage: "approval",
-    reason,
-    retryable
-  });
-}
-
-function classifyHandlerError(error: unknown): string {
-  if (error instanceof Error && error.name.length > 0) {
-    return error.name;
-  }
-
-  return "unknown-handler-error";
 }

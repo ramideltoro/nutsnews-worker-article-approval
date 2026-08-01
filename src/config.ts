@@ -16,6 +16,7 @@ export interface ApprovalConfigVariable {
 
 export const APPROVAL_CONFIG_SCHEMA = [
   variable("NUTSNEWS_ENVIRONMENT", "Runtime environment label for logs and metrics.", false, false, "local"),
+  variable("NUTSNEWS_APPROVAL_BUILD_REVISION", "Immutable lowercase 40-character Git commit revision baked into the production image.", true, false, "development"),
   variable("NUTSNEWS_APPROVAL_HTTP_HOST", "Health and metrics bind host.", false, false, "0.0.0.0"),
   variable("NUTSNEWS_APPROVAL_HTTP_PORT", "Health and metrics bind port.", false, false, "8080"),
   variable("NUTSNEWS_APPROVAL_DEPENDENCY_MODE", "Use test dependencies locally or require production dependency presence.", false, false, "test"),
@@ -50,6 +51,7 @@ export interface ApprovalConfig {
   readonly serviceName: typeof APPROVAL_SERVICE_NAME;
   readonly serviceVersion: typeof APPROVAL_SERVICE_VERSION;
   readonly environment: string;
+  readonly buildRevision: string;
   readonly host: string;
   readonly http: {
     readonly host: string;
@@ -103,6 +105,7 @@ export class ApprovalConfigError extends Error {
 
 export function loadApprovalConfig(env: NodeJS.ProcessEnv = process.env): ApprovalConfig {
   const issues: string[] = [];
+  const environment = nonEmpty(env.NUTSNEWS_ENVIRONMENT, "local").toLowerCase();
   const dependencyMode = parseDependencyMode(env.NUTSNEWS_APPROVAL_DEPENDENCY_MODE, issues);
   const dependencies = {
     databaseConfigured: hasValue(env.NUTSNEWS_APPROVAL_DATABASE_URL),
@@ -118,12 +121,19 @@ export function loadApprovalConfig(env: NodeJS.ProcessEnv = process.env): Approv
     requireConfigured("NUTSNEWS_APPROVAL_QWEN_API_KEY", dependencies.qwenCredentialConfigured, issues);
   }
 
+  if (environment === "production" && dependencyMode !== "production") {
+    issues.push("NUTSNEWS_APPROVAL_DEPENDENCY_MODE must be production when NUTSNEWS_ENVIRONMENT=production.");
+  }
+
+  const buildRevision = parseBuildRevision(env.NUTSNEWS_APPROVAL_BUILD_REVISION, dependencyMode, issues);
+
   const concurrency = parseInteger(env.NUTSNEWS_APPROVAL_CONCURRENCY, "NUTSNEWS_APPROVAL_CONCURRENCY", 2, 1, 16, issues);
   const prefetch = parseInteger(env.NUTSNEWS_APPROVAL_PREFETCH, "NUTSNEWS_APPROVAL_PREFETCH", 4, 1, 64, issues);
   const config: ApprovalConfig = {
     serviceName: APPROVAL_SERVICE_NAME,
     serviceVersion: APPROVAL_SERVICE_VERSION,
-    environment: nonEmpty(env.NUTSNEWS_ENVIRONMENT, "local"),
+    environment,
+    buildRevision,
     host: nonEmpty(env.HOSTNAME, os.hostname()),
     http: {
       host: nonEmpty(env.NUTSNEWS_APPROVAL_HTTP_HOST, "0.0.0.0"),
@@ -238,7 +248,7 @@ function hasValue(value: string | undefined): boolean {
 }
 
 function parseDependencyMode(value: string | undefined, issues: string[]): ApprovalDependencyMode {
-  const normalized = nonEmpty(value, "test");
+  const normalized = nonEmpty(value, "test").toLowerCase();
 
   if (normalized === "test" || normalized === "production") {
     return normalized;
@@ -246,6 +256,20 @@ function parseDependencyMode(value: string | undefined, issues: string[]): Appro
 
   issues.push("NUTSNEWS_APPROVAL_DEPENDENCY_MODE must be test or production.");
   return "test";
+}
+
+function parseBuildRevision(
+  value: string | undefined,
+  dependencyMode: ApprovalDependencyMode,
+  issues: string[]
+): string {
+  const revision = nonEmpty(value, "development");
+
+  if (dependencyMode === "production" && !/^[0-9a-f]{40}$/u.test(revision)) {
+    issues.push("NUTSNEWS_APPROVAL_BUILD_REVISION must be a lowercase 40-character Git commit SHA when NUTSNEWS_APPROVAL_DEPENDENCY_MODE=production.");
+  }
+
+  return revision;
 }
 
 function parseTelemetryLogMode(value: string | undefined, issues: string[]): ApprovalTelemetryLogMode {

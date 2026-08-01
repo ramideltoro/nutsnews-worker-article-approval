@@ -15,7 +15,6 @@ import {
   type BrokerDeliveryHandler,
   type BrokerPublishCommand,
   type BrokerPublishReceipt,
-  type RuntimeBrokerTransport,
   type RuntimeClock,
   type RuntimeHandlerResult,
   type RuntimeIdempotencyClaimContext,
@@ -29,6 +28,8 @@ import {
 
 import type {
   ApprovalBrokerOutbox,
+  ApprovalBrokerTransport,
+  ApprovalClaimOwnership,
   ApprovalDatabaseTransaction,
   ApprovalDatabaseTransactionRunner,
   ApprovalDependencies,
@@ -46,6 +47,7 @@ import type {
   ApprovalWorkHandler,
   ApprovalWorkTools
 } from "./dependencies.js";
+import { ApprovalClaimOwnershipError } from "./dependencies.js";
 
 export class ManualApprovalClock implements RuntimeClock {
   private current: Date;
@@ -69,6 +71,11 @@ export class InMemoryApprovalStateStore implements ApprovalStateStore {
   readonly decisions: ApprovalStoredDecision[] = [];
   readonly enrichmentRecords = new Map<string, ApprovalEnrichmentRecord>();
   private readonly store;
+  private readonly activeClaims = new Map<string, {
+    readonly claimToken: string;
+    readonly controller: AbortController;
+  }>();
+  private acceptingClaims = true;
 
   constructor(clock: RuntimeClock = new ManualApprovalClock()) {
     this.store = createInMemoryIdempotencyStore(clock);
@@ -81,16 +88,76 @@ export class InMemoryApprovalStateStore implements ApprovalStateStore {
     };
   }
 
-  claim(idempotencyKey: string, context: RuntimeIdempotencyClaimContext): Promise<RuntimeIdempotencyClaimResult> {
-    return this.store.claim(idempotencyKey, context);
+  async claim(idempotencyKey: string, context: RuntimeIdempotencyClaimContext): Promise<RuntimeIdempotencyClaimResult> {
+    const result = await this.store.claim(idempotencyKey, context);
+
+    if (result.status === "claimed") {
+      this.activeClaims.get(idempotencyKey)?.controller.abort(
+        new ApprovalClaimOwnershipError("Approval idempotency claim was replaced.")
+      );
+      this.activeClaims.set(idempotencyKey, {
+        claimToken: result.claimToken,
+        controller: new AbortController()
+      });
+      if (!this.acceptingClaims) {
+        this.activeClaims.get(idempotencyKey)?.controller.abort(
+          new ApprovalClaimOwnershipError("Approval state store is not accepting new claims.")
+        );
+      }
+    }
+
+    return result;
   }
 
-  markCompleted(idempotencyKey: string, completion: RuntimeIdempotencyCompletion): Promise<void> {
-    return this.store.markCompleted(idempotencyKey, completion);
+  async markCompleted(idempotencyKey: string, completion: RuntimeIdempotencyCompletion): Promise<void> {
+    try {
+      await this.store.markCompleted(idempotencyKey, completion);
+    } finally {
+      this.finishClaim(idempotencyKey, completion.claimToken);
+    }
   }
 
-  markFailed(idempotencyKey: string, failure: RuntimeIdempotencyFailure): Promise<void> {
-    return this.store.markFailed(idempotencyKey, failure);
+  async markFailed(idempotencyKey: string, failure: RuntimeIdempotencyFailure): Promise<void> {
+    try {
+      await this.store.markFailed(idempotencyKey, failure);
+    } finally {
+      this.finishClaim(idempotencyKey, failure.claimToken);
+    }
+  }
+
+  async releaseClaim(idempotencyKey: string, failure: RuntimeIdempotencyFailure) {
+    try {
+      return await this.store.releaseClaim(idempotencyKey, failure);
+    } finally {
+      this.finishClaim(idempotencyKey, failure.claimToken);
+    }
+  }
+
+  ownership(idempotencyKey: string): ApprovalClaimOwnership {
+    const active = this.activeClaims.get(idempotencyKey);
+
+    if (active === undefined) {
+      throw new ApprovalClaimOwnershipError("No active approval idempotency claim exists.");
+    }
+
+    return {
+      signal: active.controller.signal,
+      assertOwned: () => {
+        if (this.activeClaims.get(idempotencyKey) !== active || active.controller.signal.aborted) {
+          throw ownershipAbortReason(active.controller.signal);
+        }
+      }
+    };
+  }
+
+  abortActiveClaims(reason: string): Promise<void> {
+    this.acceptingClaims = false;
+    for (const active of this.activeClaims.values()) {
+      active.controller.abort(new ApprovalClaimOwnershipError(reason));
+    }
+
+    this.activeClaims.clear();
+    return Promise.resolve();
   }
 
   loadEnrichmentRecord(input: ApprovalEnrichmentRecordInput, transaction: ApprovalDatabaseTransaction): Promise<ApprovalEnrichmentRecord> {
@@ -182,6 +249,14 @@ export class InMemoryApprovalStateStore implements ApprovalStateStore {
   seedEnrichmentRecord(record: ApprovalEnrichmentRecord): void {
     this.enrichmentRecords.set(enrichmentRecordKey(record.canonicalArticleId, record.articleVersion), record);
   }
+
+  private finishClaim(idempotencyKey: string, claimToken: string): void {
+    const active = this.activeClaims.get(idempotencyKey);
+
+    if (active?.claimToken === claimToken) {
+      this.activeClaims.delete(idempotencyKey);
+    }
+  }
 }
 
 export class LocalApprovalTransactionRunner implements ApprovalDatabaseTransactionRunner {
@@ -196,14 +271,21 @@ export class LocalApprovalTransactionRunner implements ApprovalDatabaseTransacti
     };
   }
 
-  async withTransaction<T>(operation: (transaction: ApprovalDatabaseTransaction) => Promise<T>): Promise<T> {
+  async withTransaction<T>(
+    operation: (transaction: ApprovalDatabaseTransaction) => Promise<T>,
+    signal?: AbortSignal
+  ): Promise<T> {
+    throwIfOperationAborted(signal);
     const transaction = {
       transactionId: `local-transaction-${String(this.transactions.length + 1)}`
     };
 
     this.transactions.push(transaction);
 
-    return operation(transaction);
+    const value = await waitForOperation(operation(transaction), signal);
+    throwIfOperationAborted(signal);
+
+    return value as T;
   }
 }
 
@@ -219,7 +301,8 @@ export class LocalApprovalBrokerOutbox implements ApprovalBrokerOutbox {
     };
   }
 
-  record(command: BrokerPublishCommand, receipt: BrokerPublishReceipt): Promise<void> {
+  record(command: BrokerPublishCommand, receipt: BrokerPublishReceipt, signal?: AbortSignal): Promise<void> {
+    throwIfOperationAborted(signal);
     this.records.push({
       command,
       receipt
@@ -259,14 +342,16 @@ export class LocalApprovalQwenClient implements ApprovalQwenClient {
     };
   }
 
-  async review(request: ApprovalQwenRequest): Promise<unknown> {
+  async review(request: ApprovalQwenRequest, signal?: AbortSignal): Promise<unknown> {
+    throwIfOperationAborted(signal);
     this.requests.push(request);
     this.activeRequests += 1;
     this.maxActiveRequests = Math.max(this.maxActiveRequests, this.activeRequests);
     this.onReviewStart?.();
 
     try {
-      await this.reviewGate;
+      await waitForOperation(this.reviewGate, signal);
+      throwIfOperationAborted(signal);
 
       if (this.error !== undefined) {
         const reason = typeof this.error === "string" ? this.error : "local Qwen fixture error";
@@ -317,16 +402,55 @@ export class LocalApprovalWorkHandler implements ApprovalWorkHandler {
   onHandleStart: (() => void) | undefined;
 
   async handle(context: RuntimeMessageContext, tools: ApprovalWorkTools): Promise<RuntimeHandlerResult> {
-    void tools;
+    tools.assertOwnership();
     this.onHandleStart?.();
-    await this.handleGate;
+    await waitForOperation(this.handleGate, tools.signal);
+    tools.assertOwnership();
     this.handled.push(context);
 
     return this.result;
   }
 }
 
-export class LocalBrokerTransport implements RuntimeBrokerTransport {
+function throwIfOperationAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted === true) {
+    throw ownershipAbortReason(signal);
+  }
+}
+
+function ownershipAbortReason(signal: AbortSignal): Error {
+  return signal.reason instanceof Error
+    ? signal.reason
+    : new ApprovalClaimOwnershipError();
+}
+
+function waitForOperation<T>(operation: Promise<T> | undefined, signal: AbortSignal | undefined): Promise<T | undefined> {
+  if (operation === undefined) {
+    throwIfOperationAborted(signal);
+    return Promise.resolve(undefined);
+  }
+
+  if (signal === undefined) {
+    return operation;
+  }
+
+  throwIfOperationAborted(signal);
+
+  return new Promise((resolve, reject) => {
+    const onAbort = (): void => {
+      reject(ownershipAbortReason(signal));
+    };
+
+    signal.addEventListener("abort", onAbort, {
+      once: true
+    });
+    void operation.then(resolve, reject).finally(() => {
+      signal.removeEventListener("abort", onAbort);
+    });
+  });
+}
+
+export class LocalBrokerTransport implements ApprovalBrokerTransport {
   readonly name: string = "local-broker-transport";
   readonly inFlightDeliveryCount = 0;
   readonly assertedRoutes: WorkerRoute[] = [];
@@ -364,6 +488,11 @@ export class LocalBrokerTransport implements RuntimeBrokerTransport {
       confirmed: true,
       confirmedAt: command.envelope.occurredAt
     });
+  }
+
+  publishOwned(command: BrokerPublishCommand, signal: AbortSignal): Promise<BrokerPublishReceipt> {
+    throwIfOperationAborted(signal);
+    return this.publish(command);
   }
 
   consume(stage: WorkerStage, handler: BrokerDeliveryHandler): Promise<BrokerConsumerHandle> {
@@ -413,6 +542,7 @@ export function createLocalApprovalDependencies(options: {
   const clock = options.clock ?? new ManualApprovalClock();
 
   return {
+    adapterMode: "in_memory",
     clock,
     stateStore: new InMemoryApprovalStateStore(clock),
     transactionRunner: new LocalApprovalTransactionRunner(),

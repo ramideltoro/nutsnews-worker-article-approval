@@ -5,7 +5,8 @@ import type {
   RuntimeClock,
   RuntimeHandlerResult,
   RuntimeIdempotencyStore,
-  RuntimeMessageContext
+  RuntimeMessageContext,
+  RuntimeAdapterMode
 } from "@ramideltoro/nutsnews-worker-runtime";
 
 export interface ApprovalDependencyProbe {
@@ -16,6 +17,8 @@ export interface ApprovalDependencyProbe {
 export interface ApprovalStateStore extends RuntimeIdempotencyStore {
   readonly name: string;
   probe(): ApprovalDependencyProbe | Promise<ApprovalDependencyProbe>;
+  ownership(idempotencyKey: string): ApprovalClaimOwnership;
+  abortActiveClaims(reason: string): Promise<void>;
   loadEnrichmentRecord(input: ApprovalEnrichmentRecordInput, transaction: ApprovalDatabaseTransaction): Promise<ApprovalEnrichmentRecord>;
   findDecision(key: ApprovalDecisionKey, transaction: ApprovalDatabaseTransaction): Promise<ApprovalStoredDecision | undefined>;
   recordDecision(decision: ApprovalStoredDecision, transaction: ApprovalDatabaseTransaction): Promise<ApprovalStoredDecision>;
@@ -29,19 +32,31 @@ export interface ApprovalDatabaseTransaction {
 export interface ApprovalDatabaseTransactionRunner {
   readonly name: string;
   probe(): ApprovalDependencyProbe | Promise<ApprovalDependencyProbe>;
-  withTransaction<T>(operation: (transaction: ApprovalDatabaseTransaction) => Promise<T>): Promise<T>;
+  withTransaction<T>(
+    operation: (transaction: ApprovalDatabaseTransaction) => Promise<T>,
+    signal?: AbortSignal
+  ): Promise<T>;
 }
 
 export interface ApprovalBrokerOutbox {
   readonly name: string;
   probe(): ApprovalDependencyProbe | Promise<ApprovalDependencyProbe>;
-  record(command: BrokerPublishCommand, receipt: BrokerPublishReceipt): Promise<void>;
+  record(command: BrokerPublishCommand, receipt: BrokerPublishReceipt, signal?: AbortSignal): Promise<void>;
+}
+
+export interface ApprovalBrokerTransport extends RuntimeBrokerTransport {
+  publishOwned(command: BrokerPublishCommand, signal: AbortSignal): Promise<BrokerPublishReceipt>;
 }
 
 export interface ApprovalQwenClient {
   readonly name: string;
   probe(): ApprovalDependencyProbe | Promise<ApprovalDependencyProbe>;
-  review(request: ApprovalQwenRequest): Promise<unknown>;
+  review(request: ApprovalQwenRequest, signal?: AbortSignal): Promise<unknown>;
+}
+
+export interface ApprovalClaimOwnership {
+  readonly signal: AbortSignal;
+  assertOwned(): void;
 }
 
 export interface ApprovalPrompt {
@@ -58,9 +73,18 @@ export interface ApprovalPromptRegistry {
 }
 
 export interface ApprovalWorkTools {
+  readonly signal: AbortSignal;
+  assertOwnership(): void;
   publish(command: BrokerPublishCommand): Promise<BrokerPublishReceipt>;
   recordOutbox(command: BrokerPublishCommand, receipt: BrokerPublishReceipt): Promise<void>;
   withTransaction<T>(operation: (transaction: ApprovalDatabaseTransaction) => Promise<T>): Promise<T>;
+}
+
+export class ApprovalClaimOwnershipError extends Error {
+  constructor(message = "Approval idempotency claim ownership is no longer certain.") {
+    super(message);
+    this.name = "ApprovalClaimOwnershipError";
+  }
 }
 
 export interface ApprovalWorkHandler {
@@ -69,11 +93,12 @@ export interface ApprovalWorkHandler {
 }
 
 export interface ApprovalDependencies {
+  readonly adapterMode: RuntimeAdapterMode;
   readonly clock: RuntimeClock;
   readonly stateStore: ApprovalStateStore;
   readonly transactionRunner: ApprovalDatabaseTransactionRunner;
   readonly brokerOutbox: ApprovalBrokerOutbox;
-  readonly brokerTransport: RuntimeBrokerTransport;
+  readonly brokerTransport: ApprovalBrokerTransport;
   readonly qwenClient: ApprovalQwenClient;
   readonly promptRegistry: ApprovalPromptRegistry;
   readonly workHandler: ApprovalWorkHandler;

@@ -3,8 +3,7 @@ import { timingSafeEqual } from "node:crypto";
 import type { AddressInfo } from "node:net";
 
 import {
-  runtimeHealthEndpointResponse,
-  type PrometheusRuntimeTelemetrySink
+  runtimeHealthEndpointResponse
 } from "@ramideltoro/nutsnews-worker-runtime";
 
 import {
@@ -16,12 +15,13 @@ import {
   type ApprovalReconciliationRequest,
   type ApprovalReconciler
 } from "./reconciliation.js";
+import type { ApprovalRuntimeMetricsSink } from "./metrics.js";
 import type { ApprovalService } from "./service.js";
 
 export interface ApprovalHttpServerOptions {
   readonly config: ApprovalConfig;
   readonly service: ApprovalService;
-  readonly metrics?: PrometheusRuntimeTelemetrySink;
+  readonly metrics?: ApprovalRuntimeMetricsSink;
   readonly reconciler?: ApprovalReconciler;
   readonly reconciliationToken?: string;
 }
@@ -102,6 +102,7 @@ async function routeRequest(
       writeHealth(response, await options.service.health.readiness());
       return;
     case "/metrics":
+      await refreshHealthMetrics(options.service);
       writeText(response, 200, options.metrics?.collect() ?? "", "text/plain; version=0.0.4; charset=utf-8");
       return;
     case "/config-schema":
@@ -116,6 +117,16 @@ async function routeRequest(
         status: "not-found"
       });
   }
+}
+
+async function refreshHealthMetrics(service: ApprovalService): Promise<void> {
+  const health = service.health;
+
+  await Promise.all([
+    health.liveness(),
+    health.startup(),
+    health.readiness()
+  ]);
 }
 
 async function handleReconciliationRequest(
