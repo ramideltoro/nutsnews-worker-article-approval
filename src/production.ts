@@ -2387,6 +2387,7 @@ function decisionFromRow(row: ApprovalDecisionRow | undefined): ApprovalStoredDe
   }
 
   const modelMetadata = objectValue(row.model_metadata);
+  const legacySnapshot = objectValue(snapshot);
   const promptParts = (row.prompt_version ?? "unknown:0.0.0").split(":");
   const promptId = stringFrom(modelMetadata.promptId, promptParts[0] ?? "unknown");
   const promptVersion = stringFrom(modelMetadata.promptVersion, promptParts[1] ?? DEFAULT_PROMPT_VERSION);
@@ -2407,6 +2408,17 @@ function decisionFromRow(row: ApprovalDecisionRow | undefined): ApprovalStoredDe
     canonicalArticleId: row.article_identity_hash,
     articleVersion: row.approval_version,
     canonicalUrl: stringFrom(diagnostic.canonicalUrl, "https://example.invalid/approval-shadow"),
+    title: stringFrom(legacySnapshot.title, ""),
+    ...(typeof legacySnapshot.description === "string" ? {
+      description: legacySnapshot.description
+    } : {}),
+    ...(typeof legacySnapshot.imageUrl === "string" ? {
+      imageUrl: legacySnapshot.imageUrl
+    } : {}),
+    ...(typeof legacySnapshot.publishedAt === "string" ? {
+      publishedAt: legacySnapshot.publishedAt
+    } : {}),
+    category: stringFrom(legacySnapshot.category, ""),
     decision: approvalRuntimeDecision(row.decision),
     ...(typeof diagnostic.rejectionReason === "string" ? {
       rejectionReason: diagnostic.rejectionReason
@@ -2419,6 +2431,9 @@ function decisionFromRow(row: ApprovalDecisionRow | undefined): ApprovalStoredDe
     confidenceScore: numberFrom(modelMetadata.confidenceScore, 0),
     qualityScore: numberFrom(modelMetadata.qualityScore, 0),
     sourceLanguage: stringFrom(modelMetadata.sourceLanguage, "en"),
+    ...(typeof legacySnapshot.sourceSummary === "string" ? {
+      sourceSummary: legacySnapshot.sourceSummary
+    } : {}),
     contentFingerprint: stringFrom(diagnostic.contentFingerprint, row.article_identity_hash),
     reviewRef: reviewRefFromDiagnostic(diagnostic, decisionId, row.article_identity_hash, row.approval_version, promptId, promptVersion, model, traceparent, sourceMessageId),
     ...(isApprovalSummaryRef(modelMetadata.summaryRef) ? {
@@ -2480,6 +2495,7 @@ function mapLocalAiReview(raw: unknown, request: ApprovalQwenRequest, latencyMs:
   return {
     decision: accepted ? "accepted" : "rejected",
     reasonCode: normalizeReasonCode(raw.category ?? raw.reason, accepted ? "newsworthy" : "not-newsworthy"),
+    category: stringFrom(raw.category, "Uplifting"),
     confidenceScore: accepted ? 92 : 88,
     qualityScore: accepted ? 90 : 85,
     positivityScore: localPositivityScore(raw.positivity_score ?? raw.positivityScore),
@@ -2875,6 +2891,9 @@ function isApprovalDecisionSnapshot(value: unknown): value is ApprovalStoredDeci
     && typeof value.decisionId === "string"
     && typeof value.canonicalArticleId === "string"
     && typeof value.articleVersion === "number"
+    && typeof value.canonicalUrl === "string"
+    && typeof value.title === "string"
+    && typeof value.category === "string"
     && typeof value.decision === "string"
     && typeof value.provider === "string"
     && typeof value.model === "string"
