@@ -93,6 +93,10 @@ export class InMemoryApprovalStateStore implements ApprovalStateStore {
     return this.store.markFailed(idempotencyKey, failure);
   }
 
+  releaseClaim(idempotencyKey: string, failure: RuntimeIdempotencyFailure) {
+    return this.store.releaseClaim(idempotencyKey, failure);
+  }
+
   loadEnrichmentRecord(input: ApprovalEnrichmentRecordInput, transaction: ApprovalDatabaseTransaction): Promise<ApprovalEnrichmentRecord> {
     void transaction;
     const key = enrichmentRecordKey(input.articleMetadataRef.canonicalArticleId, input.articleMetadataRef.articleVersion);

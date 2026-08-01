@@ -79,6 +79,7 @@ export {
   type ApprovalReconciler
 } from "./reconciliation.js";
 export {
+  APPROVAL_IDEMPOTENCY_LEASE_SECONDS,
   LocalAiApprovalQwenClient,
   PayloadRabbitMqTransport,
   PostgresApprovalBrokerOutbox,
@@ -358,7 +359,8 @@ function hasReconciliationToken(
   return typeof candidate.reconciliationToken === "string" && candidate.reconciliationToken.length > 0;
 }
 
-export const SUPPORTED_RUNTIME_PACKAGE_VERSION = "0.5.0";
+export const SUPPORTED_CONTRACTS_PACKAGE_VERSION = "1.0.0";
+export const SUPPORTED_RUNTIME_PACKAGE_VERSION = "1.0.0";
 
 function assertPackageCompatibility(): void {
   const contracts = getContractPackageMetadata();
@@ -366,7 +368,7 @@ function assertPackageCompatibility(): void {
   const contractsVersion: string = contracts.packageVersion;
   const runtimeVersion: string = runtime.packageVersion;
 
-  if (contractsVersion !== "0.4.0") {
+  if (contractsVersion !== SUPPORTED_CONTRACTS_PACKAGE_VERSION) {
     throw new Error(`Unsupported contracts package version ${contractsVersion}.`);
   }
 

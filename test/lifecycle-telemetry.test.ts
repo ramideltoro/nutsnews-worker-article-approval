@@ -147,7 +147,7 @@ describe("approval lifecycle telemetry", () => {
     });
     expect(completed[2]).toMatchObject({
       name: "runtime.message.invalid",
-      outcome: "failure",
+      outcome: "invalid",
       attributes: {
         issueCode: "payload-consumer-mismatch",
         issuePath: "$.schemaId"
@@ -200,14 +200,14 @@ describe("approval lifecycle telemetry", () => {
       operation: "markCompleted",
       action: "retry",
       completion: "runtime.message.retry",
-      reason: "idempotency-mark-completed-error",
+      reason: "idempotency-completion-error",
       attemptCount: 1
     },
     {
       operation: "markFailed",
       action: "retry",
       completion: "runtime.message.retry",
-      reason: "idempotency-mark-failed-error",
+      reason: "idempotency-failure-record-error",
       attemptCount: 1
     }
   ] as const)("contains $operation failure as one $action completion", async ({
@@ -261,6 +261,35 @@ describe("approval lifecycle telemetry", () => {
     await context.service.stop();
   });
 
+  it("acknowledges an ambiguous completion when conditional release observes completed work", async () => {
+    const context = createTelemetryContext();
+    const originalMarkCompleted = context.dependencies.stateStore.markCompleted.bind(context.dependencies.stateStore);
+
+    vi.spyOn(context.dependencies.stateStore, "markCompleted").mockImplementation(async (idempotencyKey, completion) => {
+      await originalMarkCompleted(idempotencyKey, completion);
+      throw new Error("completion response unavailable");
+    });
+    await context.service.start();
+    context.telemetry.clear();
+
+    const delivery = approvalDelivery(10);
+    await expect(context.broker.deliverApproval(delivery)).resolves.toMatchObject({
+      action: "ack",
+      reason: "handled"
+    });
+    await expect(context.broker.deliverApproval(delivery)).resolves.toMatchObject({
+      action: "ack",
+      reason: "duplicate"
+    });
+    expect(context.workHandler.handled).toHaveLength(1);
+    expect(context.telemetry.events.filter((event) => COMPLETING_MESSAGE_EVENTS.has(event.name)).map((event) => event.name)).toEqual([
+      "runtime.message.accepted",
+      "runtime.message.duplicate"
+    ]);
+
+    await context.service.stop();
+  });
+
   it("counts every lifecycle outcome once with bounded labels and keeps identifiers out of Prometheus", async () => {
     const context = createTelemetryContext();
 
@@ -284,17 +313,17 @@ describe("approval lifecycle telemetry", () => {
     const output = context.metrics.collect();
     expect(metricValue(output, "nutsnews_worker_messages_total", "success")).toBe(1);
     expect(metricValue(output, "nutsnews_worker_messages_total", "duplicate")).toBe(1);
-    expect(metricValue(output, "nutsnews_worker_messages_total", "failure")).toBe(1);
+    expect(metricValue(output, "nutsnews_worker_messages_total", "invalid")).toBe(1);
     expect(metricValue(output, "nutsnews_worker_messages_total", "retry")).toBe(1);
     expect(metricValue(output, "nutsnews_worker_messages_total", "dlq")).toBe(2);
     expect(metricValue(output, "nutsnews_worker_retries_total", "retry")).toBe(1);
-    expect(metricValue(output, "nutsnews_worker_dlq_total", "failure")).toBe(1);
+    expect(metricValue(output, "nutsnews_worker_dlq_total", "invalid")).toBe(1);
     expect(metricValue(output, "nutsnews_worker_dlq_total", "dlq")).toBe(2);
-    expect(metricValue(output, "nutsnews_worker_processing_duration_ms_count", "success")).toBe(1);
-    expect(metricValue(output, "nutsnews_worker_processing_duration_ms_count", "duplicate")).toBe(1);
-    expect(metricValue(output, "nutsnews_worker_processing_duration_ms_count", "failure")).toBe(1);
-    expect(metricValue(output, "nutsnews_worker_processing_duration_ms_count", "retry")).toBe(1);
-    expect(metricValue(output, "nutsnews_worker_processing_duration_ms_count", "dlq")).toBe(2);
+    expect(metricValue(output, "nutsnews_worker_processing_duration_seconds_count", "success")).toBe(1);
+    expect(metricValue(output, "nutsnews_worker_processing_duration_seconds_count", "duplicate")).toBe(1);
+    expect(metricValue(output, "nutsnews_worker_processing_duration_seconds_count", "invalid")).toBe(1);
+    expect(metricValue(output, "nutsnews_worker_processing_duration_seconds_count", "retry")).toBe(1);
+    expect(metricValue(output, "nutsnews_worker_processing_duration_seconds_count", "dlq")).toBe(2);
     expect(metricValue(output, "nutsnews_worker_uplift_stage_events_total", "success")).toBe(1);
     expect(metricValue(output, "nutsnews_worker_uplift_stage_events_total", "duplicate")).toBe(1);
     expect(metricValue(output, "nutsnews_worker_uplift_stage_events_total", "invalid")).toBe(1);
@@ -463,14 +492,14 @@ describe("approval lifecycle telemetry", () => {
       durationMs: 37
     });
     const output = metrics.collect();
-    expect(sampleValue(output, "nutsnews_worker_dependency_duration_ms_count", {
+    expect(sampleValue(output, "nutsnews_worker_dependency_duration_seconds_count", {
       queue: "nutsnews.worker.approval.v1",
       outcome: "success"
     })).toBe(1);
-    expect(sampleValue(output, "nutsnews_worker_dependency_duration_ms_sum", {
+    expect(sampleValue(output, "nutsnews_worker_dependency_duration_seconds_sum", {
       queue: "nutsnews.worker.approval.v1",
       outcome: "success"
-    })).toBe(37);
+    })).toBe(0.037);
   });
 });
 
@@ -812,7 +841,12 @@ function expectedMetricLabelNames(line: string): readonly string[] {
     ];
   }
 
+  const actual = metricLabelNames(line);
+
   return [
-    ...RUNTIME_ALLOWED_METRIC_LABELS
+    ...RUNTIME_ALLOWED_METRIC_LABELS.filter((label) => actual.includes(label)),
+    ...(actual.includes("le") ? [
+      "le"
+    ] : [])
   ];
 }

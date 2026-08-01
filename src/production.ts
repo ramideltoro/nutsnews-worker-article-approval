@@ -29,6 +29,7 @@ import {
   type RuntimeBrokerTransport,
   type RuntimeClock,
   type RuntimeIdempotencyClaimContext,
+  type RuntimeIdempotencyClaimReleaseResult,
   type RuntimeIdempotencyClaimResult,
   type RuntimeIdempotencyCompletion,
   type RuntimeIdempotencyFailure,
@@ -83,6 +84,7 @@ const APPROVAL_SCHEMA = "worker_uplift_approval";
 const DEFAULT_PROMPT_VERSION = "0.1.0";
 const DEFAULT_CONFIRM_TIMEOUT_MS = WORKER_DELIVERY_BEHAVIOR.confirmTimeoutMs;
 const DEFAULT_DRAIN_TIMEOUT_MS = 30_000;
+export const APPROVAL_IDEMPOTENCY_LEASE_SECONDS = 5 * 60;
 
 export type ProductionApprovalDependencies = ApprovalDependencies & {
   readonly reconciler: ApprovalReconciler;
@@ -597,12 +599,20 @@ export class PostgresApprovalStateStore implements ApprovalStateStore {
     idempotencyKey: string,
     context: RuntimeIdempotencyClaimContext
   ): Promise<RuntimeIdempotencyClaimResult> {
+    const claimToken = randomUUID();
     const inserted = await this.pool.query<{ readonly received_at: Date }>(
       `INSERT INTO ${APPROVAL_SCHEMA}.inbox (
         message_id, pipeline_run_id, stage_execution_id, source_stage, source_message_id,
         entity_kind, entity_id, schema_version, operation_version, idempotency_key,
         payload_ref, payload_digest, received_at, status, diagnostic_metadata
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::timestamptz, 'processing', $14::jsonb)
+      ) VALUES (
+        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::timestamptz, 'processing',
+        $14::jsonb || jsonb_build_object(
+          'idempotencyClaimToken', $15::text,
+          'claimedAt', statement_timestamp(),
+          'idempotencyLeaseAcquiredAtEpochSeconds', extract(epoch FROM statement_timestamp())
+        )
+      )
       ON CONFLICT (idempotency_key) DO NOTHING
       RETURNING received_at`,
       [
@@ -621,8 +631,10 @@ export class PostgresApprovalStateStore implements ApprovalStateStore {
         context.receivedAt,
         JSON.stringify({
           route: context.envelope.route,
-          attempt: context.envelope.attempt
-        })
+          attempt: context.envelope.attempt,
+          claimMessageId: context.envelope.messageId
+        }),
+        claimToken
       ]
     );
 
@@ -630,7 +642,8 @@ export class PostgresApprovalStateStore implements ApprovalStateStore {
       return {
         status: "claimed",
         firstSeenAt: context.receivedAt,
-        replay: false
+        replay: false,
+        claimToken
       };
     }
 
@@ -638,8 +651,12 @@ export class PostgresApprovalStateStore implements ApprovalStateStore {
       readonly status: string;
       readonly received_at: Date;
       readonly processed_at: Date | null;
+      readonly claim_token: string | null;
+      readonly lease_acquired_at_epoch_seconds: string | null;
     }>(
-      `SELECT status, received_at, processed_at
+      `SELECT status, received_at, processed_at,
+              diagnostic_metadata->>'idempotencyClaimToken' AS claim_token,
+              diagnostic_metadata->>'idempotencyLeaseAcquiredAtEpochSeconds' AS lease_acquired_at_epoch_seconds
        FROM ${APPROVAL_SCHEMA}.inbox
        WHERE idempotency_key = $1`,
       [idempotencyKey]
@@ -664,27 +681,84 @@ export class PostgresApprovalStateStore implements ApprovalStateStore {
     }
 
     if (row.status === "failed" || row.status === "parked") {
-      await this.pool.query(
+      const replayed = await this.pool.query<{ readonly received_at: Date }>(
         `UPDATE ${APPROVAL_SCHEMA}.inbox
          SET status = 'processing',
+             processed_at = NULL,
              sanitized_error_code = NULL,
              sanitized_error_message = NULL,
-             diagnostic_metadata = diagnostic_metadata || $2::jsonb
-         WHERE idempotency_key = $1`,
+             diagnostic_metadata = diagnostic_metadata || $2::jsonb || jsonb_build_object(
+               'idempotencyClaimToken', $3::text,
+               'claimedAt', statement_timestamp(),
+               'idempotencyLeaseAcquiredAtEpochSeconds', extract(epoch FROM statement_timestamp()),
+               'replayedAt', statement_timestamp()
+             )
+         WHERE idempotency_key = $1
+           AND status IN ('failed', 'parked')
+         RETURNING received_at`,
         [
           idempotencyKey,
           JSON.stringify({
-            replayedAt: context.receivedAt,
-            replayMessageId: context.envelope.messageId
-          })
+            replayMessageId: context.envelope.messageId,
+            claimMessageId: context.envelope.messageId
+          }),
+          claimToken
         ]
       );
 
-      return {
-        status: "claimed",
-        firstSeenAt,
-        replay: true
-      };
+      if ((replayed.rowCount ?? 0) > 0) {
+        return {
+          status: "claimed",
+          firstSeenAt,
+          replay: true,
+          claimToken
+        };
+      }
+    }
+
+    if (row.status === "processing"
+      && typeof row.claim_token === "string"
+      && typeof row.lease_acquired_at_epoch_seconds === "string") {
+      const reclaimed = await this.pool.query<{ readonly received_at: Date }>(
+        `UPDATE ${APPROVAL_SCHEMA}.inbox
+         SET diagnostic_metadata = diagnostic_metadata || $2::jsonb || jsonb_build_object(
+               'idempotencyClaimToken', $3::text,
+               'claimedAt', statement_timestamp(),
+               'idempotencyLeaseAcquiredAtEpochSeconds', extract(epoch FROM statement_timestamp()),
+               'leaseReclaimedAt', statement_timestamp()
+             )
+         WHERE idempotency_key = $1
+           AND status = 'processing'
+           AND diagnostic_metadata->>'idempotencyClaimToken' = $4
+           AND diagnostic_metadata->>'idempotencyLeaseAcquiredAtEpochSeconds' = $5
+           AND CASE
+             WHEN jsonb_typeof(diagnostic_metadata->'idempotencyLeaseAcquiredAtEpochSeconds') = 'number'
+             THEN (diagnostic_metadata->>'idempotencyLeaseAcquiredAtEpochSeconds')::numeric
+               <= extract(epoch FROM statement_timestamp()) - $6::numeric
+             ELSE false
+           END
+         RETURNING received_at`,
+        [
+          idempotencyKey,
+          JSON.stringify({
+            replayMessageId: context.envelope.messageId,
+            claimMessageId: context.envelope.messageId
+          }),
+          claimToken,
+          row.claim_token,
+          row.lease_acquired_at_epoch_seconds,
+          APPROVAL_IDEMPOTENCY_LEASE_SECONDS
+        ]
+      );
+
+      if ((reclaimed.rowCount ?? 0) > 0) {
+        return {
+          status: "claimed",
+          firstSeenAt,
+          replay: true,
+          claimToken
+        };
+      }
     }
 
     return {
@@ -694,31 +768,42 @@ export class PostgresApprovalStateStore implements ApprovalStateStore {
   }
 
   async markCompleted(idempotencyKey: string, completion: RuntimeIdempotencyCompletion): Promise<void> {
-    await this.pool.query(
+    const completed = await this.pool.query(
       `UPDATE ${APPROVAL_SCHEMA}.inbox
        SET status = 'processed',
            processed_at = $2::timestamptz,
-           diagnostic_metadata = diagnostic_metadata || $3::jsonb
-       WHERE idempotency_key = $1`,
+           diagnostic_metadata = (((diagnostic_metadata - 'idempotencyClaimToken') - 'claimedAt') - 'idempotencyLeaseAcquiredAtEpochSeconds') || $3::jsonb
+       WHERE idempotency_key = $1
+         AND status = 'processing'
+         AND diagnostic_metadata->>'idempotencyClaimToken' = $4
+       RETURNING idempotency_key`,
       [
         idempotencyKey,
         completion.completedAt,
         JSON.stringify({
           completedMessageId: completion.messageId,
           completedStage: completion.stage
-        })
+        }),
+        completion.claimToken
       ]
     );
+
+    if ((completed.rowCount ?? 0) !== 1) {
+      throw new Error("Cannot complete an idempotency claim owned by another delivery.");
+    }
   }
 
   async markFailed(idempotencyKey: string, failure: RuntimeIdempotencyFailure): Promise<void> {
-    await this.pool.query(
+    const failed = await this.pool.query(
       `UPDATE ${APPROVAL_SCHEMA}.inbox
        SET status = 'failed',
            sanitized_error_code = $2,
            sanitized_error_message = $3,
-           diagnostic_metadata = diagnostic_metadata || $4::jsonb
-       WHERE idempotency_key = $1`,
+           diagnostic_metadata = (((diagnostic_metadata - 'idempotencyClaimToken') - 'claimedAt') - 'idempotencyLeaseAcquiredAtEpochSeconds') || $4::jsonb
+       WHERE idempotency_key = $1
+         AND status = 'processing'
+         AND diagnostic_metadata->>'idempotencyClaimToken' = $5
+       RETURNING idempotency_key`,
       [
         idempotencyKey,
         sanitizeCode(failure.reason),
@@ -727,9 +812,64 @@ export class PostgresApprovalStateStore implements ApprovalStateStore {
           failedAt: failure.failedAt,
           failedMessageId: failure.messageId,
           retryable: failure.retryable
-        })
+        }),
+        failure.claimToken
       ]
     );
+
+    if ((failed.rowCount ?? 0) !== 1) {
+      throw new Error("Cannot fail an idempotency claim owned by another delivery.");
+    }
+  }
+
+  async releaseClaim(
+    idempotencyKey: string,
+    failure: RuntimeIdempotencyFailure
+  ): Promise<RuntimeIdempotencyClaimReleaseResult> {
+    const released = await this.pool.query(
+      `UPDATE ${APPROVAL_SCHEMA}.inbox
+       SET status = 'failed',
+           sanitized_error_code = $2,
+           sanitized_error_message = $3,
+           diagnostic_metadata = (((diagnostic_metadata - 'idempotencyClaimToken') - 'claimedAt') - 'idempotencyLeaseAcquiredAtEpochSeconds') || $4::jsonb
+       WHERE idempotency_key = $1
+         AND status = 'processing'
+         AND diagnostic_metadata->>'idempotencyClaimToken' = $5
+       RETURNING idempotency_key`,
+      [
+        idempotencyKey,
+        sanitizeCode(failure.reason),
+        sanitizeMessage(failure.reason),
+        JSON.stringify({
+          failedAt: failure.failedAt,
+          failedMessageId: failure.messageId,
+          retryable: failure.retryable,
+          claimReleaseReason: failure.reason
+        }),
+        failure.claimToken
+      ]
+    );
+
+    if ((released.rowCount ?? 0) === 1) {
+      return {
+        status: "released"
+      };
+    }
+
+    const existing = await this.pool.query<{ readonly status: string }>(
+      `SELECT status
+       FROM ${APPROVAL_SCHEMA}.inbox
+       WHERE idempotency_key = $1`,
+      [idempotencyKey]
+    );
+
+    return existing.rows[0]?.status === "processed" || existing.rows[0]?.status === "duplicate"
+      ? {
+          status: "preserved-completed"
+        }
+      : {
+          status: "not-owned"
+        };
   }
 
   loadEnrichmentRecord(
