@@ -776,6 +776,12 @@ export class PostgresApprovalStateStore implements ApprovalStateStore {
        WHERE idempotency_key = $1
          AND status = 'processing'
          AND diagnostic_metadata->>'idempotencyClaimToken' = $4
+         AND CASE
+           WHEN jsonb_typeof(diagnostic_metadata->'idempotencyLeaseAcquiredAtEpochSeconds') = 'number'
+           THEN (diagnostic_metadata->>'idempotencyLeaseAcquiredAtEpochSeconds')::numeric
+             > extract(epoch FROM statement_timestamp()) - $5::numeric
+           ELSE false
+         END
        RETURNING idempotency_key`,
       [
         idempotencyKey,
@@ -784,7 +790,8 @@ export class PostgresApprovalStateStore implements ApprovalStateStore {
           completedMessageId: completion.messageId,
           completedStage: completion.stage
         }),
-        completion.claimToken
+        completion.claimToken,
+        APPROVAL_IDEMPOTENCY_LEASE_SECONDS
       ]
     );
 
@@ -803,6 +810,12 @@ export class PostgresApprovalStateStore implements ApprovalStateStore {
        WHERE idempotency_key = $1
          AND status = 'processing'
          AND diagnostic_metadata->>'idempotencyClaimToken' = $5
+         AND CASE
+           WHEN jsonb_typeof(diagnostic_metadata->'idempotencyLeaseAcquiredAtEpochSeconds') = 'number'
+           THEN (diagnostic_metadata->>'idempotencyLeaseAcquiredAtEpochSeconds')::numeric
+             > extract(epoch FROM statement_timestamp()) - $6::numeric
+           ELSE false
+         END
        RETURNING idempotency_key`,
       [
         idempotencyKey,
@@ -813,7 +826,8 @@ export class PostgresApprovalStateStore implements ApprovalStateStore {
           failedMessageId: failure.messageId,
           retryable: failure.retryable
         }),
-        failure.claimToken
+        failure.claimToken,
+        APPROVAL_IDEMPOTENCY_LEASE_SECONDS
       ]
     );
 
@@ -835,6 +849,12 @@ export class PostgresApprovalStateStore implements ApprovalStateStore {
        WHERE idempotency_key = $1
          AND status = 'processing'
          AND diagnostic_metadata->>'idempotencyClaimToken' = $5
+         AND CASE
+           WHEN jsonb_typeof(diagnostic_metadata->'idempotencyLeaseAcquiredAtEpochSeconds') = 'number'
+           THEN (diagnostic_metadata->>'idempotencyLeaseAcquiredAtEpochSeconds')::numeric
+             > extract(epoch FROM statement_timestamp()) - $6::numeric
+           ELSE false
+         END
        RETURNING idempotency_key`,
       [
         idempotencyKey,
@@ -846,7 +866,8 @@ export class PostgresApprovalStateStore implements ApprovalStateStore {
           retryable: failure.retryable,
           claimReleaseReason: failure.reason
         }),
-        failure.claimToken
+        failure.claimToken,
+        APPROVAL_IDEMPOTENCY_LEASE_SECONDS
       ]
     );
 

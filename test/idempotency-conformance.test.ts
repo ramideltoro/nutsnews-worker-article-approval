@@ -285,7 +285,7 @@ describe("Runtime 1.0 idempotency conformance", () => {
     expect(completedDatabase.calls).toHaveLength(2);
   });
 
-  it("uses claim-token compare-and-set for PostgreSQL completion and failure", async () => {
+  it("uses claim-token and unexpired-lease compare-and-set for PostgreSQL completion and failure", async () => {
     const completedDatabase = scriptedPool([
       result(1, [
         {
@@ -300,7 +300,10 @@ describe("Runtime 1.0 idempotency conformance", () => {
     expect(completedDatabase.calls[0]?.sql).toContain("diagnostic_metadata->>'idempotencyClaimToken' = $4");
     expect(completedDatabase.calls[0]?.sql).toContain("diagnostic_metadata - 'idempotencyClaimToken'");
     expect(completedDatabase.calls[0]?.sql).toContain("- 'idempotencyLeaseAcquiredAtEpochSeconds'");
+    expect(completedDatabase.calls[0]?.sql).toContain("jsonb_typeof(diagnostic_metadata->'idempotencyLeaseAcquiredAtEpochSeconds') = 'number'");
+    expect(completedDatabase.calls[0]?.sql).toContain("> extract(epoch FROM statement_timestamp()) - $5::numeric");
     expect(completedDatabase.calls[0]?.values?.[3]).toBe("completion-token");
+    expect(completedDatabase.calls[0]?.values?.[4]).toBe(APPROVAL_IDEMPOTENCY_LEASE_SECONDS);
 
     const failedDatabase = scriptedPool([
       result(1, [
@@ -314,7 +317,9 @@ describe("Runtime 1.0 idempotency conformance", () => {
     await expect(failedStore.markFailed("approval-key", failure("failure-token"))).resolves.toBeUndefined();
     expect(failedDatabase.calls[0]?.sql).toContain("AND status = 'processing'");
     expect(failedDatabase.calls[0]?.sql).toContain("diagnostic_metadata->>'idempotencyClaimToken' = $5");
+    expect(failedDatabase.calls[0]?.sql).toContain("> extract(epoch FROM statement_timestamp()) - $6::numeric");
     expect(failedDatabase.calls[0]?.values?.[4]).toBe("failure-token");
+    expect(failedDatabase.calls[0]?.values?.[5]).toBe(APPROVAL_IDEMPOTENCY_LEASE_SECONDS);
 
     await expect(new PostgresApprovalStateStore(scriptedPool([
       result(0)
@@ -339,7 +344,9 @@ describe("Runtime 1.0 idempotency conformance", () => {
       status: "released"
     });
     expect(releasedDatabase.calls[0]?.sql).toContain("diagnostic_metadata->>'idempotencyClaimToken' = $5");
+    expect(releasedDatabase.calls[0]?.sql).toContain("> extract(epoch FROM statement_timestamp()) - $6::numeric");
     expect(releasedDatabase.calls[0]?.values?.[4]).toBe("owned-token");
+    expect(releasedDatabase.calls[0]?.values?.[5]).toBe(APPROVAL_IDEMPOTENCY_LEASE_SECONDS);
 
     const completedDatabase = scriptedPool([
       result(0),
@@ -370,6 +377,69 @@ describe("Runtime 1.0 idempotency conformance", () => {
     )).resolves.toEqual({
       status: "not-owned"
     });
+  });
+
+  it("expires owner mutation rights before reclaim and gives the exact boundary to the reclaimer", async () => {
+    const firstSeenAt = new Date("2026-08-01T11:50:00.000Z");
+    const database = scriptedPool([
+      result(0),
+      result(0),
+      result(1, [
+        {
+          status: "processing"
+        }
+      ]),
+      result(0),
+      result(1, [
+        {
+          status: "processing",
+          received_at: firstSeenAt,
+          processed_at: null,
+          claim_token: "expired-owner-token",
+          lease_acquired_at_epoch_seconds: "1785585000.000"
+        }
+      ]),
+      result(1, [
+        {
+          received_at: firstSeenAt
+        }
+      ])
+    ]);
+    const store = new PostgresApprovalStateStore(database.pool);
+
+    await expect(store.markCompleted("approval-key", completion("expired-owner-token"))).rejects.toThrow(
+      "owned by another delivery"
+    );
+    await expect(store.releaseClaim("approval-key", failure("expired-owner-token"))).resolves.toEqual({
+      status: "not-owned"
+    });
+
+    const envelope = createMinimalApprovalEnvelope({
+      idempotencyKey: "approval-key"
+    });
+    const reclaimed = await store.claim("approval-key", {
+      envelope,
+      stage: "approval",
+      receivedAt: RECEIVED_AT
+    });
+    expect(reclaimed).toMatchObject({
+      status: "claimed",
+      replay: true
+    });
+    if (reclaimed.status !== "claimed") {
+      throw new Error("Expected the expired lease to transfer to a new owner.");
+    }
+    expect(reclaimed.claimToken).not.toBe("expired-owner-token");
+
+    const completionAttempt = database.calls[0];
+    const releaseAttempt = database.calls[1];
+    const reclaimAttempt = database.calls[5];
+    expect(completionAttempt?.sql).toContain("> extract(epoch FROM statement_timestamp()) - $5::numeric");
+    expect(completionAttempt?.values?.[4]).toBe(APPROVAL_IDEMPOTENCY_LEASE_SECONDS);
+    expect(releaseAttempt?.sql).toContain("> extract(epoch FROM statement_timestamp()) - $6::numeric");
+    expect(releaseAttempt?.values?.[5]).toBe(APPROVAL_IDEMPOTENCY_LEASE_SECONDS);
+    expect(reclaimAttempt?.sql).toContain("<= extract(epoch FROM statement_timestamp()) - $6::numeric");
+    expect(reclaimAttempt?.values?.[5]).toBe(APPROVAL_IDEMPOTENCY_LEASE_SECONDS);
   });
 });
 
