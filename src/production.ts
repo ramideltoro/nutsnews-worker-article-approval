@@ -1166,7 +1166,9 @@ export class PostgresApprovalOutboxReconciler implements ApprovalReconciler {
   ): Promise<{ readonly payload?: Readonly<Record<string, unknown>>; readonly envelope?: WorkerMessageEnvelope }> {
     const diagnostic = objectValue(row.diagnostic_metadata);
 
-    if (isRecord(diagnostic.payload) && isRecord(diagnostic.envelope)) {
+    if (isRecord(diagnostic.payload)
+      && isRecord(diagnostic.envelope)
+      && row.payload_digest === sha256Json(diagnostic.payload)) {
       return {};
     }
 
