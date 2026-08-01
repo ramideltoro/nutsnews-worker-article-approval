@@ -218,6 +218,89 @@ describe("approval outbox reconciliation", () => {
     expect(replay?.envelope.payloadRef.uri).toBe(row.payload_ref);
     expect(pool.queries.some((query) => query.sql.includes("approval_decisions"))).toBe(true);
   });
+
+  it("reconstructs the authoritative payload after PostgreSQL JSONB reorders a complete carrier", async () => {
+    const decision = approvalDecisionSnapshot();
+    const payload = translationPayloadFromDecision(decision);
+    const row = legacyOutboxRow(decision, payload);
+    const pool = new FakePool([
+      {
+        ...row,
+        diagnostic_metadata: {
+          envelope: translationCommand().envelope,
+          payload: reversePayloadInsertionOrder(payload),
+          payloadSchemaId: STAGE_PAYLOAD_SCHEMA_IDS.translationTask
+        }
+      }
+    ], [
+      approvalDecisionRow(decision)
+    ]);
+    const transport = new FakeBrokerTransport();
+    const reconciler = new PostgresApprovalOutboxReconciler({
+      pool: pool.asPool(),
+      brokerTransport: transport,
+      clock,
+      config,
+      env: {}
+    });
+
+    const report = await reconciler.reconcile({
+      mode: "dry-run",
+      runId: "recovery-jsonb-order"
+    });
+
+    expect(report).toMatchObject({
+      status: "dry_run",
+      selectedCount: 1,
+      failedClosedCount: 0,
+      writesPerformed: false
+    });
+    expect(transport.published).toHaveLength(0);
+  });
+
+  it("still fails closed when the authoritative approval payload digest is tampered", async () => {
+    const decision = approvalDecisionSnapshot();
+    const payload = translationPayloadFromDecision(decision);
+    const row = legacyOutboxRow(decision, payload);
+    const diagnosticCommand = translationCommand();
+    const pool = new FakePool([
+      {
+        ...row,
+        payload_digest: `sha256:${"0".repeat(64)}`,
+        diagnostic_metadata: {
+          envelope: {
+            ...diagnosticCommand.envelope,
+            payloadRef: {
+              ...diagnosticCommand.envelope.payloadRef,
+              uri: row.payload_ref
+            }
+          },
+          payload: reversePayloadInsertionOrder(payload),
+          payloadSchemaId: STAGE_PAYLOAD_SCHEMA_IDS.translationTask
+        }
+      }
+    ], [
+      approvalDecisionRow(decision)
+    ]);
+    const transport = new FakeBrokerTransport();
+    const reconciler = new PostgresApprovalOutboxReconciler({
+      pool: pool.asPool(),
+      brokerTransport: transport,
+      clock,
+      config,
+      env: {}
+    });
+
+    const report = await reconciler.reconcile({
+      mode: "dry-run",
+      runId: "recovery-tampered-digest"
+    });
+
+    expect(report.status).toBe("failed_closed");
+    expect(report.errors).toContain("legacy-1:payload-digest-mismatch");
+    expect(report.writesPerformed).toBe(false);
+    expect(transport.published).toHaveLength(0);
+  });
 });
 
 function translationCommand(): BrokerPublishCommand {
@@ -370,7 +453,7 @@ function translationPayloadFromDecision(decision: ReturnType<typeof approvalDeci
 function legacyOutboxRow(
   decision: ReturnType<typeof approvalDecisionSnapshot>,
   payload: Readonly<Record<string, unknown>>
-): QueryResultRow {
+): QueryResultRow & { readonly payload_ref: string } {
   return {
     id: "legacy-1",
     outbox_message_id: "018f1598-2dd5-7c4f-9f92-8f7a7f8b3410",
