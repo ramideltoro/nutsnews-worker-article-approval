@@ -22,7 +22,7 @@ export const APPROVAL_STAGE_LATENCY_BUCKETS_SECONDS = [
   300
 ] as const;
 
-export type ApprovalStageOutcome = "success" | "duplicate" | "invalid" | "retry" | "dlq";
+export type ApprovalStageOutcome = "success" | "duplicate" | "invalid" | "retry" | "dlq" | "failure";
 export type ApprovalHealthProbe = "liveness" | "startup" | "readiness";
 export type ApprovalHealthOutcome = "ok" | "degraded" | "unhealthy";
 
@@ -54,7 +54,8 @@ const APPROVAL_STAGE_OUTCOMES = [
   "duplicate",
   "invalid",
   "retry",
-  "dlq"
+  "dlq",
+  "failure"
 ] as const satisfies readonly ApprovalStageOutcome[];
 const HEALTH_PROBES = [
   "liveness",

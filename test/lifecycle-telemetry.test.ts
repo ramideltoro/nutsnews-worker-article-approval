@@ -51,14 +51,15 @@ describe("approval lifecycle telemetry", () => {
     const initialStageSamples = canonicalStageSampleLines(initial);
 
     expect(context.metrics.collect()).toBe(initial);
-    expect(initialStageSamples).toHaveLength(5 + APPROVAL_STAGE_LATENCY_BUCKETS_SECONDS.length + 3);
+    expect(initialStageSamples).toHaveLength(6 + APPROVAL_STAGE_LATENCY_BUCKETS_SECONDS.length + 3);
     expect(initialStageSamples.every((line) => line.endsWith(" 0"))).toBe(true);
     expect(approvalStageOutcomesFromMetrics(initial)).toEqual([
       "success",
       "duplicate",
       "invalid",
       "retry",
-      "dlq"
+      "dlq",
+      "failure"
     ]);
     expect(histogramBoundaries(initial)).toEqual([
       ...APPROVAL_STAGE_LATENCY_BUCKETS_SECONDS.map(String),
